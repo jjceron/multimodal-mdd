@@ -256,3 +256,6 @@ tmp/
 # Archives (large data transfer files)
 *.tar.gz
 *.tar
+
+# VS Code
+.vscode/
