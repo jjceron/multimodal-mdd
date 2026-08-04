@@ -48,6 +48,13 @@ def flatten_batch(x: torch.Tensor) -> tuple[torch.Tensor, int]:
     return x.reshape(n_subjects * windows, channels, samples), windows
 
 
+def zscore_windows(x: torch.Tensor) -> torch.Tensor:
+    """Per-window, per-channel z-score over the time axis."""
+    mean = x.mean(dim=-1, keepdim=True)
+    std = x.std(dim=-1, keepdim=True, unbiased=False)
+    return (x - mean) / (std + 1e-8)
+
+
 def expand_labels(y: torch.Tensor, windows: int) -> torch.Tensor:
     """Repeat each subject label once per window."""
     return y.view(-1, 1).repeat(1, windows).reshape(-1)
@@ -107,6 +114,7 @@ def train_fold(
         tr_loss, tr_correct, tr_total = 0.0, 0, 0
         for _, x, y in train_loader:
             flat, windows = flatten_batch(x)
+            flat = zscore_windows(flat)
             yf = expand_labels(y, windows).to(device)
             optimizer.zero_grad()
             logits = forward_logits(model, flat.to(device))
@@ -122,6 +130,7 @@ def train_fold(
         with torch.no_grad():
             for _, x, y in val_loader:
                 flat, windows = flatten_batch(x)
+                flat = zscore_windows(flat)
                 yf = expand_labels(y, windows)
                 logits = forward_logits(model, flat.to(device))
                 val_loss += criterion(logits, yf.to(device)).item() * len(yf)
@@ -169,6 +178,7 @@ def run_fold_test(model: torch.nn.Module, test_loader, device: str) -> dict:
     with torch.no_grad():
         for _, x, y in test_loader:
             flat, windows = flatten_batch(x)
+            flat = zscore_windows(flat)
             logits = forward_logits(model, flat.to(device)).cpu()
             logits_subj = logits.view(x.shape[0], windows, -1)
             yf = expand_labels(y, windows)
@@ -196,6 +206,8 @@ def run_fold_test(model: torch.nn.Module, test_loader, device: str) -> dict:
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Unimodal MODMA EEG classification")
+    parser.add_argument("--modal", type=str, default="eeg",
+                        choices=["eeg", "aud"])
     parser.add_argument("--channels", type=str, default="10-20",
                         choices=["all", "10-20", "f64"])
     parser.add_argument("--model", type=str, default="cnn_lstm",
@@ -205,11 +217,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--split-seed", type=int, default=2509)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--tag", type=str, default="base")
-    parser.add_argument("--epochs", type=int, default=50)
+    parser.add_argument("--epochs", type=int, default=100)
     parser.add_argument("--batch-size", type=int, default=8)
-    parser.add_argument("--lr", type=float, default=1e-3)
+    parser.add_argument("--lr", type=float, default=3e-4)
     parser.add_argument("--weight-decay", type=float, default=1e-4)
-    parser.add_argument("--patience", type=int, default=10)
+    parser.add_argument("--patience", type=int, default=20)
     parser.add_argument("--dropout", type=float, default=0.5)
     parser.add_argument("--output-root", type=str, default=str(DEFAULT_OUTPUT_ROOT))
     parser.add_argument("--save-model", action="store_true")
@@ -246,7 +258,7 @@ def main() -> None:
     results_folds = []
 
     for fold_idx, (train_loader, val_loader, test_loader) in enumerate(folds):
-        print(f"\n=== Fold {fold_idx} ({args.model}) ===")
+        print(f"\n=== Fold {fold_idx} ===")
         model = build_model(
             args.model, n_channels, n_classes=2, n_samples=n_samples,
             dropout=args.dropout,
