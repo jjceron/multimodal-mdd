@@ -1,12 +1,13 @@
 """Plot training curves, confusion matrices, and ROC from JSON results."""
 
-import os
-import sys
+import argparse
 import glob as globmod
 import json
-import argparse
-import numpy as np
+import os
+import sys
+
 import matplotlib
+import numpy as np
 
 matplotlib.use("Agg" if not os.environ.get("DISPLAY") and os.name != "nt" else "TkAgg")
 import matplotlib.pyplot as plt
@@ -326,7 +327,8 @@ def _detect_type_and_load(args):
     nested_path = os.path.join(RESULTS_ROOT, args.type, args.model, "results.json")
     if os.path.exists(nested_path):
         # Nested structure: <type>/<model>/results.json
-        results = json.load(open(nested_path))
+        with open(nested_path) as f:
+            results = json.load(f)
         out_dir = os.path.join(FIGURES_ROOT, args.type, args.model)
         os.makedirs(out_dir, exist_ok=True)
         subtype = args.subtype or "fusion"
@@ -351,8 +353,14 @@ def _detect_type_and_load(args):
     results_path = os.path.join(
         RESULTS_ROOT, benchmark, f"{args.model}_{args.channels}{suffix}.json"
     )
-    curves = json.load(open(curves_path)) if os.path.exists(curves_path) else None
-    results = json.load(open(results_path)) if os.path.exists(results_path) else None
+    curves = None
+    if os.path.exists(curves_path):
+        with open(curves_path) as f:
+            curves = json.load(f)
+    results = None
+    if os.path.exists(results_path):
+        with open(results_path) as f:
+            results = json.load(f)
     if curves is None and results is None:
         print(f"ERROR: no files found for {args.model}_{args.channels}{suffix}")
         sys.exit(1)
@@ -379,7 +387,8 @@ def _find_experiment_dir(tag, seed, base_dirs):
             dirs = sorted(globmod.glob(pattern, recursive=True))
         if dirs:
             exp_dir = dirs[-1]
-            results = json.load(open(os.path.join(exp_dir, "results.json")))
+            with open(os.path.join(exp_dir, "results.json")) as f:
+                results = json.load(f)
             return exp_dir, results
     print(f"ERROR: no experiment dir for tag={tag}, seed={seed}")
     sys.exit(1)
@@ -391,7 +400,7 @@ def _load_crossmodal_nested(args):
     else:
         bases = [os.path.join(RESULTS_ROOT, d) for d in _available_types()]
 
-    exp_dir, results = _find_experiment_dir(args.tag, args.seed, bases)
+    _exp_dir, results = _find_experiment_dir(args.tag, args.seed, bases)
 
     subtype = args.subtype or "fusion"
     hist_key = {
@@ -701,7 +710,6 @@ def main():
         return
 
     # ── Default: loss + bacc for all folds ─────────────────────────────
-    folds_data = folds_data  # already loaded above
     show_all = args.all or args.fold is None
 
     if show_all:

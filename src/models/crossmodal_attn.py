@@ -1,8 +1,9 @@
 """Cross-modal attention fusion for EEG + audio."""
 
-import torch
-import torch.nn as nn
 import math
+
+import torch
+from torch import nn
 
 
 class RMSNorm(nn.Module):

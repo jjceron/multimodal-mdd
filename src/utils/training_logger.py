@@ -3,7 +3,6 @@
 import numpy as np
 from sklearn.metrics import accuracy_score, balanced_accuracy_score, f1_score
 
-
 # ── Classification Logger ──────────────────────────────────────────────
 
 _KEYS_CLAS = ["acc", "bacc", "f1", "sens", "spec"]
