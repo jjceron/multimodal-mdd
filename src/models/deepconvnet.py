@@ -5,8 +5,6 @@ from __future__ import annotations
 import torch
 from torch import Tensor, nn
 
-from .sinc_conv import SincConv2d
-
 
 class DeepConvNet(nn.Module):
     def __init__(
@@ -15,26 +13,16 @@ class DeepConvNet(nn.Module):
         n_classes: int = 1,
         n_samples: int = 500,
         dropout: float = 0.5,
-        sinc: bool = False,
     ) -> None:
         super().__init__()
 
-        if sinc:
-            self.block1 = nn.Sequential(
-                SincConv2d(1, 4, (1, 10), sample_rate=250),
-                nn.BatchNorm2d(4),
-                nn.ELU(),
-                nn.MaxPool2d((1, 3)),
-                nn.Dropout2d(dropout),
-            )
-        else:
-            self.block1 = nn.Sequential(
-                nn.Conv2d(1, 4, (1, 10)),
-                nn.BatchNorm2d(4),
-                nn.ELU(),
-                nn.MaxPool2d((1, 3)),
-                nn.Dropout2d(dropout),
-            )
+        self.block1 = nn.Sequential(
+            nn.Conv2d(1, 4, (1, 10)),
+            nn.BatchNorm2d(4),
+            nn.ELU(),
+            nn.MaxPool2d((1, 3)),
+            nn.Dropout2d(dropout),
+        )
 
         self.block2 = nn.Sequential(
             nn.Conv2d(4, 8, (n_channels, 1)),
