@@ -1,0 +1,7 @@
+name: venv
+channels:
+  - defaults
+dependencies:
+  - python=3.11
+  - poetry
+prefix: C:\Users\jhon0\.anaconda-desktop\micromamba\envs\cuda\envs\venv
