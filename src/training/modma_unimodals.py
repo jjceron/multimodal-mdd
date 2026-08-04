@@ -1,0 +1,291 @@
+"""Unimodal EEG classification on MODMA with nested group K-fold CV.
+
+Each model is trained on 2-second EEG windows extracted per subject. Validation
+tracks window-level metrics every epoch (early stopping on val accuracy). The
+final evaluation is done per subject via majority vote over its windows.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+from pathlib import Path
+
+import numpy as np
+import torch
+from sklearn.metrics import roc_auc_score
+
+from src.models.cnn_lstm import CNNLSTM
+from src.models.deepconvnet import DeepConvNet
+from src.models.eegnet import EEGNet
+from src.models.shallowconvnet import ShallowConvNet
+from src.preprocessing.modma_eeg import MODMADataset, create_dataloaders
+from src.utils.get_seed import set_seed
+from src.utils.training_logger import ClassificationLogger
+
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
+DEFAULT_OUTPUT_ROOT = PROJECT_ROOT / "outputs/results/unimodals/eeg"
+
+MODEL_CLASSES = {
+    "deepconvnet": DeepConvNet,
+    "shallowconvnet": ShallowConvNet,
+    "cnn_lstm": CNNLSTM,
+    "eegnet": EEGNet,
+}
+
+
+def forward_logits(model: torch.nn.Module, x: torch.Tensor) -> torch.Tensor:
+    """Forward pass returning only the class logits tensor."""
+    out = model(x)
+    if isinstance(out, tuple):
+        out = out[0]
+    return out
+
+
+def flatten_batch(x: torch.Tensor) -> tuple[torch.Tensor, int]:
+    """Flatten subject windows into the batch dimension."""
+    n_subjects, windows, channels, samples = x.shape
+    return x.reshape(n_subjects * windows, channels, samples), windows
+
+
+def expand_labels(y: torch.Tensor, windows: int) -> torch.Tensor:
+    """Repeat each subject label once per window."""
+    return y.view(-1, 1).repeat(1, windows).reshape(-1)
+
+
+def build_model(
+    name: str, n_channels: int, n_classes: int, n_samples: int, dropout: float
+) -> torch.nn.Module:
+    cls = MODEL_CLASSES[name]
+    if name == "eegnet":
+        return cls(n_channels=n_channels, n_classes=n_classes, dropout=dropout)
+    return cls(
+        n_channels=n_channels,
+        n_classes=n_classes,
+        n_samples=n_samples,
+        dropout=dropout,
+    )
+
+
+def confusion_matrix(true, pred) -> list[list[int]]:
+    t, p = np.asarray(true, dtype=int), np.asarray(pred, dtype=int)
+    return [
+        [int(((t == 0) & (p == 0)).sum()), int(((t == 0) & (p == 1)).sum())],
+        [int(((t == 1) & (p == 0)).sum()), int(((t == 1) & (p == 1)).sum())],
+    ]
+
+
+def train_fold(
+    model: torch.nn.Module,
+    train_loader,
+    val_loader,
+    epochs: int,
+    lr: float,
+    weight_decay: float,
+    patience: int,
+    device: str,
+    logger: ClassificationLogger,
+) -> dict:
+    optimizer = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=weight_decay)
+    criterion = torch.nn.CrossEntropyLoss()
+    history = {
+        "train_loss": [],
+        "val_loss": [],
+        "train_acc": [],
+        "val_acc": [],
+        "val_bacc": [],
+        "val_f1": [],
+        "val_sens": [],
+        "val_spec": [],
+    }
+
+    best_val_acc, best_state, patience_left = -1.0, None, 0
+    logger.log_header()
+
+    for epoch in range(1, epochs + 1):
+        model.train()
+        tr_loss, tr_correct, tr_total = 0.0, 0, 0
+        for _, x, y in train_loader:
+            flat, windows = flatten_batch(x)
+            yf = expand_labels(y, windows).to(device)
+            optimizer.zero_grad()
+            logits = forward_logits(model, flat.to(device))
+            loss = criterion(logits, yf)
+            loss.backward()
+            optimizer.step()
+            tr_loss += loss.item() * len(yf)
+            tr_correct += (logits.argmax(1) == yf).sum().item()
+            tr_total += len(yf)
+
+        model.eval()
+        val_loss, val_true, val_pred = 0.0, [], []
+        with torch.no_grad():
+            for _, x, y in val_loader:
+                flat, windows = flatten_batch(x)
+                yf = expand_labels(y, windows)
+                logits = forward_logits(model, flat.to(device))
+                val_loss += criterion(logits, yf.to(device)).item() * len(yf)
+                val_true.extend(yf.tolist())
+                val_pred.extend(logits.argmax(1).cpu().tolist())
+
+        tr_acc = tr_correct / max(tr_total, 1)
+        tr_loss /= max(tr_total, 1)
+        val_loss /= max(len(val_true), 1)
+        vl_m = logger.metrics(val_true, val_pred)
+
+        history["train_loss"].append(tr_loss)
+        history["val_loss"].append(val_loss)
+        history["train_acc"].append(tr_acc)
+        history["val_acc"].append(vl_m["acc"])
+        history["val_bacc"].append(vl_m["bacc"])
+        history["val_f1"].append(vl_m["f1"])
+        history["val_sens"].append(vl_m["sens"])
+        history["val_spec"].append(vl_m["spec"])
+
+        if vl_m["acc"] > best_val_acc:
+            best_val_acc = vl_m["acc"]
+            best_state = {k: v.detach().clone() for k, v in model.state_dict().items()}
+            patience_left = 0
+        else:
+            patience_left += 1
+
+        logger.log_epoch(
+            epoch, tr_loss, val_loss, {"acc": tr_acc}, vl_m, patience_left
+        )
+
+        if patience_left >= patience:
+            break
+
+    if best_state is not None:
+        model.load_state_dict(best_state)
+    return history
+
+
+def run_fold_test(model: torch.nn.Module, test_loader, device: str) -> dict:
+    true_subj, pred_subj, prob_subj = [], [], []
+    true_win, pred_win = [], []
+
+    model.eval()
+    with torch.no_grad():
+        for _, x, y in test_loader:
+            flat, windows = flatten_batch(x)
+            logits = forward_logits(model, flat.to(device)).cpu()
+            logits_subj = logits.view(x.shape[0], windows, -1)
+            yf = expand_labels(y, windows)
+            true_win.extend(yf.tolist())
+            pred_win.extend(logits.argmax(1).tolist())
+
+            votes = logits_subj.argmax(dim=2).mode(dim=1).values
+            prob = logits_subj.softmax(dim=2)[:, :, 1].mean(dim=1)
+            true_subj.extend(y.numpy().tolist())
+            pred_subj.extend(votes.numpy().tolist())
+            prob_subj.extend(prob.numpy().tolist())
+
+    true, pred = np.asarray(true_subj), np.asarray(pred_subj)
+    auc = float(roc_auc_score(true, prob_subj)) if len(set(true.tolist())) > 1 else None
+
+    return {
+        "test_true": true.tolist(),
+        "test_pred": pred.tolist(),
+        "test_cm_window": confusion_matrix(true_win, pred_win),
+        "test_cm_subject": confusion_matrix(true, pred),
+        "test_roc": {"y_true": true.tolist(), "y_prob": prob_subj},
+        "test_auc": auc,
+    }
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Unimodal MODMA EEG classification")
+    parser.add_argument("--channels", type=str, default="10-20",
+                        choices=["all", "10-20", "f64"])
+    parser.add_argument("--model", type=str, default="cnn_lstm",
+                        choices=sorted(MODEL_CLASSES))
+    parser.add_argument("--k", type=int, default=5)
+    parser.add_argument("--inner-splits", type=int, default=5)
+    parser.add_argument("--split-seed", type=int, default=2509)
+    parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--tag", type=str, default="base")
+    parser.add_argument("--epochs", type=int, default=50)
+    parser.add_argument("--batch-size", type=int, default=8)
+    parser.add_argument("--lr", type=float, default=1e-3)
+    parser.add_argument("--weight-decay", type=float, default=1e-4)
+    parser.add_argument("--patience", type=int, default=10)
+    parser.add_argument("--dropout", type=float, default=0.5)
+    parser.add_argument("--output-root", type=str, default=str(DEFAULT_OUTPUT_ROOT))
+    parser.add_argument("--save-model", action="store_true")
+    return parser.parse_args()
+
+
+def main() -> None:
+    args = parse_args()
+    set_seed(args.seed)
+
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    print(f"[env] seed={args.seed} split_seed={args.split_seed} device={device}")
+
+    ds = MODMADataset(channels=args.channels)
+    n_channels = len(ds.channel_names)
+    n_samples = ds.samples[0]["eeg"].shape[-1]
+
+    folds = create_dataloaders(
+        ds,
+        k_folder=args.k,
+        inner_split=args.inner_splits,
+        split_seed=args.split_seed,
+        batch_size=args.batch_size,
+    )
+
+    out_dir = (
+        Path(args.output_root)
+        / f"unimodals_sgkf_{args.modal}_sseed{args.split_seed}_tag{args.tag}"
+    )
+    out_dir.mkdir(parents=True, exist_ok=True)
+    print(f"[out] {out_dir}")
+
+    logger = ClassificationLogger()
+    results_folds = []
+
+    for fold_idx, (train_loader, val_loader, test_loader) in enumerate(folds):
+        print(f"\n=== Fold {fold_idx} ({args.model}) ===")
+        model = build_model(
+            args.model, n_channels, n_classes=2, n_samples=n_samples,
+            dropout=args.dropout,
+        ).to(device)
+
+        history = train_fold(
+            model, train_loader, val_loader, args.epochs, args.lr,
+            args.weight_decay, args.patience, device, logger,
+        )
+
+        fold_res = run_fold_test(model, test_loader, device)
+        fold_res["fold"] = fold_idx
+        fold_res["history"] = history
+        fold_res["test_metrics"] = logger.log_fold_test(
+            fold_res["test_true"], fold_res["test_pred"]
+        )
+        results_folds.append(fold_res)
+
+        if args.save_model:
+            torch.save(
+                model.state_dict(), out_dir / f"{args.model}_fold{fold_idx}.pt"
+            )
+
+    logger.log_summary(n_folds=args.k, split_type="gkf")
+
+    results = {
+        "tag": args.tag,
+        "split_seed": args.split_seed,
+        "seed": args.seed,
+        "channels": args.channels,
+        "model": args.model,
+        "n_channels": n_channels,
+        "n_samples": n_samples,
+        "folds": results_folds,
+    }
+    with open(out_dir / "results.json", "w") as f:
+        json.dump(results, f, indent=2)
+    print(f"\nSaved results: {out_dir / 'results.json'}")
+
+
+if __name__ == "__main__":
+    main()
