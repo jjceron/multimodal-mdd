@@ -264,11 +264,12 @@ def parse_args():
     parser.add_argument("--inner-splits", type=int, default=5)
     parser.add_argument("--batch-size", type=int, default=32)
     parser.add_argument("--lowcut", type=float, default=0.5)
-    parser.add_argument("--highcut", type=float, default=60.0)
+    parser.add_argument("--highcut", type=float, default=50.0)
     parser.add_argument("--notch", type=float, default=50.0)
     parser.add_argument("--target-fs", type=float, default=None)
     parser.add_argument("--window-sec", type=float, default=2.0)
     parser.add_argument("--overlap", type=float, default=0.5)
+    parser.add_argument("--split-seed", type=int, default=2509)
     parser.add_argument("--show-subjects", action="store_true")
     return parser.parse_args()
 
@@ -290,16 +291,16 @@ def main():
     counts = Counter(int(s["label"]) for s in ds.samples)
     n_hc = counts.get(0, 0)
     n_mdd = counts.get(1, 0)
-    split_seed = 42
+    split_seed = args.split_seed
 
     line = "=" * 60
     print(line)
-    print(" MODMA EEG — dataset & nested-CV summary")
+    print(" MODMA EEG - dataset & nested-CV summary")
     print("-" * 60)
     print(f" Dataset : {len(ds)} subjects | {len(ds.channel_names)} channels ({args.channels})")
     print(f" Labels  : HC={n_hc} ({100 * n_hc / len(ds):.1f}%) | MDD={n_mdd} ({100 * n_mdd / len(ds):.1f}%)")
     print(f" Windows : {n_windows} total | per-subject shape {tuple(ds.samples[0]['eeg'].shape)}")
-    print(f" CV      : outer k={args.k} (group+strat) | inner k={args.inner_splits} | seed={split_seed}")
+    print(f" CV      : (SGKF) | outer k={args.k} | inner k={args.inner_splits} | split_seed={split_seed}")
     print(line)
 
     folds = create_dataloaders(
