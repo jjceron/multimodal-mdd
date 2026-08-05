@@ -273,7 +273,7 @@ def main() -> None:
         k_folder=args.k,
         inner_split=args.inner_splits,
         split_seed=args.split_seed,
-        batch_size=BATCH_SIZE,
+        batch_size=args.batch_size,
         num_workers=NUM_WORKERS,
         pin_memory=(device == "cuda"),
     )
