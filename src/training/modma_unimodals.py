@@ -50,11 +50,18 @@ def flatten_batch(x: torch.Tensor) -> tuple[torch.Tensor, int]:
     return x.reshape(n_subjects * windows, channels, samples), windows
 
 
-def zscore_windows(x: torch.Tensor) -> torch.Tensor:
-    """Per-window, per-channel z-score over the time axis."""
-    mean = x.mean(dim=-1, keepdim=True)
-    std = x.std(dim=-1, keepdim=True, unbiased=False)
-    return (x - mean) / (std + 1e-8)
+def channel_stats(loader):
+    """Per-channel mean/std over ALL train windows of a fold (no leakage)."""
+    x = loader.dataset.X  # [S, W, C, T]
+    mean = x.mean(dim=(0, 1, 3))
+    std = x.std(dim=(0, 1, 3), unbiased=False)
+    return mean, std
+
+
+def normalize_channels(x: torch.Tensor, mean: torch.Tensor,
+                       std: torch.Tensor) -> torch.Tensor:
+    """Apply per-channel z-score using fold-level train statistics."""
+    return (x - mean[None, :, None]) / (std[None, :, None] + 1e-8)
 
 
 def expand_labels(y: torch.Tensor, windows: int) -> torch.Tensor:
@@ -100,9 +107,12 @@ def train_fold(
     patience: int,
     device: str,
     logger: ClassificationLogger,
+    mean: torch.Tensor,
+    std: torch.Tensor,
+    label_smoothing: float,
 ) -> dict:
     optimizer = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=weight_decay)
-    criterion = torch.nn.CrossEntropyLoss()
+    criterion = torch.nn.CrossEntropyLoss(label_smoothing=label_smoothing)
     history = {
         "train_loss": [],
         "val_loss": [],
@@ -114,7 +124,7 @@ def train_fold(
         "val_spec": [],
     }
 
-    best_val_acc, best_state, patience_left = -1.0, None, 0
+    best_val_bacc, best_state, patience_left = -1.0, None, 0
     logger.log_header()
 
     for epoch in range(1, epochs + 1):
@@ -122,7 +132,7 @@ def train_fold(
         tr_loss, tr_correct, tr_total = 0.0, 0, 0
         for _, x, y in train_loader:
             flat, windows = flatten_batch(x)
-            flat = zscore_windows(flat)
+            flat = normalize_channels(flat, mean, std)
             yf = expand_labels(y, windows).to(device)
             optimizer.zero_grad()
             logits = forward_logits(model, flat.to(device))
@@ -135,20 +145,26 @@ def train_fold(
 
         model.eval()
         val_loss, val_true, val_pred = 0.0, [], []
+        val_subj_true, val_subj_pred = [], []
         with torch.no_grad():
             for _, x, y in val_loader:
                 flat, windows = flatten_batch(x)
-                flat = zscore_windows(flat)
+                flat = normalize_channels(flat, mean, std)
                 yf = expand_labels(y, windows)
                 logits = forward_logits(model, flat.to(device))
                 val_loss += criterion(logits, yf.to(device)).item() * len(yf)
                 val_true.extend(yf.tolist())
                 val_pred.extend(logits.argmax(1).cpu().tolist())
+                logits_subj = logits.view(x.shape[0], windows, -1)
+                votes = logits_subj.argmax(dim=2).mode(dim=1).values
+                val_subj_true.extend(y.cpu().tolist())
+                val_subj_pred.extend(votes.cpu().tolist())
 
         tr_acc = tr_correct / max(tr_total, 1)
         tr_loss /= max(tr_total, 1)
         val_loss /= max(len(val_true), 1)
         vl_m = logger.metrics(val_true, val_pred)
+        vs_m = logger.metrics(val_subj_true, val_subj_pred)
 
         history["train_loss"].append(tr_loss)
         history["val_loss"].append(val_loss)
@@ -159,8 +175,8 @@ def train_fold(
         history["val_sens"].append(vl_m["sens"])
         history["val_spec"].append(vl_m["spec"])
 
-        if vl_m["acc"] > best_val_acc:
-            best_val_acc = vl_m["acc"]
+        if vs_m["bacc"] > best_val_bacc:
+            best_val_bacc = vs_m["bacc"]
             best_state = {k: v.detach().clone() for k, v in model.state_dict().items()}
             patience_left = 0
         else:
@@ -178,7 +194,8 @@ def train_fold(
     return history
 
 
-def run_fold_test(model: torch.nn.Module, test_loader, device: str) -> dict:
+def run_fold_test(model: torch.nn.Module, test_loader, device: str,
+                  mean: torch.Tensor, std: torch.Tensor) -> dict:
     true_subj, pred_subj, prob_subj = [], [], []
     true_win, pred_win = [], []
 
@@ -186,7 +203,7 @@ def run_fold_test(model: torch.nn.Module, test_loader, device: str) -> dict:
     with torch.no_grad():
         for _, x, y in test_loader:
             flat, windows = flatten_batch(x)
-            flat = zscore_windows(flat)
+            flat = normalize_channels(flat, mean, std)
             logits = forward_logits(model, flat.to(device)).cpu()
             logits_subj = logits.view(x.shape[0], windows, -1)
             yf = expand_labels(y, windows)
@@ -218,6 +235,7 @@ def parse_args() -> argparse.Namespace:
                         choices=["eeg", "aud"])
     parser.add_argument("--channels", type=str, default="10-20",
                         choices=["all", "10-20", "f64"])
+    parser.add_argument("--overlap", type=float, default=0.25)
     parser.add_argument("--model", type=str, default="cnn_lstm",
                         choices=sorted(MODEL_CLASSES))
     parser.add_argument("--k", type=int, default=5)
@@ -228,9 +246,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--epochs", type=int, default=100)
     parser.add_argument("--batch-size", type=int, default=8)
     parser.add_argument("--lr", type=float, default=1e-2)
-    parser.add_argument("--weight-decay", type=float, default=1e-4)
+    parser.add_argument("--weight-decay", type=float, default=1e-3)
     parser.add_argument("--patience", type=int, default=20)
-    parser.add_argument("--dropout", type=float, default=0.1)
+    parser.add_argument("--dropout", type=float, default=0.3)
+    parser.add_argument("--label-smoothing", type=float, default=0.1)
     parser.add_argument("--output-root", type=str, default=str(DEFAULT_OUTPUT_ROOT))
     parser.add_argument("--save-model", action="store_true")
     return parser.parse_args()
@@ -242,7 +261,7 @@ def main() -> None:
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
     
-    ds = MODMADataset(channels=args.channels)
+    ds = MODMADataset(channels=args.channels, overlap=args.overlap)
     n_channels = len(ds.channel_names)
     n_samples = ds.samples[0]["eeg"].shape[-1]
 
@@ -276,14 +295,15 @@ def main() -> None:
     print(f" GPU                  : {gpu}")
     print(f" DATASET              : channels={args.channels} ({n_channels}) "
           f"samples={n_samples} windows/subj={windows_per_subject} "
-          f"subjects={len(ds.samples)}")
+          f"overlap={args.overlap} subjects={len(ds.samples)}")
     print(f" INPUT SHAPES         : window [{n_channels}, {n_samples}] | "
           f"batch [{args.batch_size}, {windows_per_subject}, {n_channels}, {n_samples}] | "
           f"flatten [{args.batch_size * windows_per_subject}, {n_channels}, {n_samples}]")
     print(f" TRAINING CONFIG      : k={args.k} inner={args.inner_splits} "
           f"split_seed={args.split_seed} seed={args.seed} epochs={args.epochs} "
           f"batch={args.batch_size} lr={args.lr} wd={args.weight_decay} "
-          f"dropout={args.dropout} patience={args.patience}")
+          f"dropout={args.dropout} label_smoothing={args.label_smoothing} "
+          f"patience={args.patience}")
     print(f" MODEL PARAMS         : total={total:,} trainable={trainable:,} frozen={frozen:,}")
     print("=" * 78)
 
@@ -307,6 +327,7 @@ def main() -> None:
 
     for fold_idx, (train_loader, val_loader, test_loader) in enumerate(folds, start=1):
         print(f"\n=== Fold {fold_idx} ===")
+        mean, std = channel_stats(train_loader)
         model = build_model(
             args.model, n_channels, n_classes=2, n_samples=n_samples,
             dropout=args.dropout,
@@ -315,9 +336,10 @@ def main() -> None:
         history = train_fold(
             model, train_loader, val_loader, args.epochs, args.lr,
             args.weight_decay, args.patience, device, logger,
+            mean, std, args.label_smoothing,
         )
 
-        fold_res = run_fold_test(model, test_loader, device)
+        fold_res = run_fold_test(model, test_loader, device, mean, std)
         fold_res["fold"] = fold_idx
         fold_res["history"] = history
         fold_res["test_metrics"] = logger.log_fold_test(
