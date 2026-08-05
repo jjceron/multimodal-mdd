@@ -211,7 +211,7 @@ def main():
     parser.add_argument("--tag", required=True, help="Experiment tag")
     parser.add_argument("--split-seed", type=int, default=2509)
     parser.add_argument("--fold", type=str, default=None,
-                        help="Comma-separated fold numbers, e.g. '1,3' (0-based). "
+                        help="Comma-separated fold numbers, e.g. '1,3' (1-based). "
                              "Omit or use --all for all folds.")
     parser.add_argument("--all", action="store_true")
     parser.add_argument("--metric", default=None,
