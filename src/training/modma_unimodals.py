@@ -243,7 +243,7 @@ def parse_args() -> argparse.Namespace:
                         choices=sorted(MODEL_CLASSES))
     parser.add_argument("--k", type=int, default=5)
     parser.add_argument("--inner-splits", type=int, default=5)
-    parser.add_argument("--split-seed", type=int, default=2509)
+    parser.add_argument("--split-seed", type=int, nargs="+", default=[2509])
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--tag", type=str, default="base")
     parser.add_argument("--epochs", type=int, default=150)
@@ -268,23 +268,7 @@ def main() -> None:
     n_channels = len(ds.channel_names)
     n_samples = ds.samples[0]["eeg"].shape[-1]
 
-    folds = create_dataloaders(
-        ds,
-        k_folder=args.k,
-        inner_split=args.inner_splits,
-        split_seed=args.split_seed,
-        batch_size=args.batch_size,
-        num_workers=NUM_WORKERS,
-        pin_memory=(device == "cuda"),
-    )
-
-    out_dir = (
-        Path(args.output_root)
-        / f"unimodals_sgkf_{args.modal}_sseed{args.split_seed}_tag{args.tag}"
-    )
-    out_dir.mkdir(parents=True, exist_ok=True)
-
-    windows_per_subject = int(ds.samples[0]["eeg"].shape[0])
+    windows = int(ds.samples[0]["eeg"].shape[0])
     model_hdr = build_model(
         args.model, n_channels, n_classes=2, n_samples=n_samples,
         dropout=args.dropout,
@@ -292,72 +276,91 @@ def main() -> None:
     total, trainable, frozen = count_parameters(model_hdr)
     gpu = torch.cuda.get_device_name(0) if torch.cuda.is_available() else "CPU"
 
-    print("=" * 78)
-    print(f" MODAL / MODEL        : {args.modal} / {args.model}")
-    print(f" DEVICE               : {device}")
-    print(f" GPU                  : {gpu}")
-    print(f" DATASET              : channels={args.channels} ({n_channels}) "
-          f"samples={n_samples} windows/subj={windows_per_subject} "
-          f"overlap={args.overlap} subjects={len(ds.samples)}")
-    print(f" INPUT SHAPES         : window [{n_channels}, {n_samples}] | "
-          f"batch [{args.batch_size}, {windows_per_subject}, {n_channels}, {n_samples}] | "
-          f"flatten [{args.batch_size * windows_per_subject}, {n_channels}, {n_samples}]")
-    print(f" TRAINING CONFIG      : k={args.k} inner={args.inner_splits} "
-          f"split_seed={args.split_seed} seed={args.seed} epochs={args.epochs} "
-          f"batch={args.batch_size} lr={args.lr} wd={args.weight_decay} "
-          f"dropout={args.dropout} label_smoothing={args.label_smoothing} "
-          f"patience={args.patience}")
-    print(f" MODEL PARAMS         : total={total:,} trainable={trainable:,} frozen={frozen:,}")
-    print("=" * 78)
+    for split_seed in args.split_seed:
+        print(f"\n{'=' * 78}\n  SPLIT SEED            : {split_seed}\n{'=' * 78}")
 
-    logger = ClassificationLogger()
-    results_folds = []
-
-    def save_results() -> None:
-        results = {
-            "modal": args.modal,
-            "tag": args.tag,
-            "split_seed": args.split_seed,
-            "seed": args.seed,
-            "channels": args.channels,
-            "model": args.model,
-            "n_channels": n_channels,
-            "n_samples": n_samples,
-            "folds": results_folds,
-        }
-        with open(out_dir / "results.json", "w") as f:
-            json.dump(results, f, indent=2)
-
-    for fold_idx, (train_loader, val_loader, test_loader) in enumerate(folds, start=1):
-        print(f"\n=== Fold {fold_idx} ===")
-        mean, std = channel_stats(train_loader)
-        model = build_model(
-            args.model, n_channels, n_classes=2, n_samples=n_samples,
-            dropout=args.dropout,
-        ).to(device)
-
-        history = train_fold(
-            model, train_loader, val_loader, args.epochs, args.lr,
-            args.weight_decay, args.patience, device, logger,
-            mean, std, args.label_smoothing,
+        folds = create_dataloaders(
+            ds,
+            k_folder=args.k,
+            inner_split=args.inner_splits,
+            split_seed=split_seed,
+            batch_size=args.batch_size,
+            num_workers=NUM_WORKERS,
+            pin_memory=(device == "cuda"),
         )
 
-        fold_res = run_fold_test(model, test_loader, device, mean, std)
-        fold_res["fold"] = fold_idx
-        fold_res["history"] = history
-        fold_res["test_metrics"] = logger.log_fold_test(
-            fold_res["test_true"], fold_res["test_pred"]
+        out_dir = (
+            Path(args.output_root)
+            / f"unimodals_sgkf_{args.modal}_sseed{split_seed}_tag{args.tag}"
         )
-        results_folds.append(fold_res)
+        out_dir.mkdir(parents=True, exist_ok=True)
 
-        if args.save_model:
-            torch.save(
-                model.state_dict(), out_dir / f"fold_{fold_idx}.pt"
+        print("=" * 78)
+        print(f" MODAL / MODEL        : {args.modal} / {args.model}")
+        print(f" DEVICE               : {device}")
+        print(f" GPU                  : {gpu}")
+        print(f" DATASET              : channels={args.channels} ({n_channels}) "
+              f"samples={n_samples} windows/subj={windows} "
+              f"overlap={args.overlap} subjects={len(ds.samples)}")
+        print(f" INPUT SHAPES         : window [{n_channels}, {n_samples}] | "
+              f"batch [{args.batch_size}, {windows}, {n_channels}, {n_samples}] | "
+              f"flatten [{args.batch_size * windows}, {n_channels}, {n_samples}]")
+        print(f" TRAINING CONFIG      : k={args.k} inner={args.inner_splits} "
+              f"split_seed={split_seed} seed={args.seed} epochs={args.epochs} "
+              f"batch={args.batch_size} lr={args.lr} wd={args.weight_decay} "
+              f"dropout={args.dropout} label_smoothing={args.label_smoothing} "
+              f"patience={args.patience}")
+        print(f" MODEL PARAMS         : total={total:,} trainable={trainable:,} frozen={frozen:,}")
+        print("=" * 78)
+
+        logger = ClassificationLogger()
+        results_folds = []
+
+        def save_results() -> None:
+            results = {
+                "modal": args.modal,
+                "tag": args.tag,
+                "split_seed": split_seed,
+                "seed": args.seed,
+                "channels": args.channels,
+                "model": args.model,
+                "n_channels": n_channels,
+                "n_samples": n_samples,
+                "folds": results_folds,
+            }
+            with open(out_dir / "results.json", "w") as f:
+                json.dump(results, f, indent=2)
+
+        for fold_idx, (train_loader, val_loader, test_loader) in enumerate(folds, start=1):
+            print(f"\n=== Fold {fold_idx} ===")
+            mean, std = channel_stats(train_loader)
+            model = build_model(
+                args.model, n_channels, n_classes=2, n_samples=n_samples,
+                dropout=args.dropout,
+            ).to(device)
+
+            history = train_fold(
+                model, train_loader, val_loader, args.epochs, args.lr,
+                args.weight_decay, args.patience, device, logger,
+                mean, std, args.label_smoothing,
             )
-        save_results()
 
-    logger.log_summary(n_folds=args.k, split_type="gkf")
-    print(f"\nFinal results: {out_dir / 'results.json'}")
+            fold_res = run_fold_test(model, test_loader, device, mean, std)
+            fold_res["fold"] = fold_idx
+            fold_res["history"] = history
+            fold_res["test_metrics"] = logger.log_fold_test(
+                fold_res["test_true"], fold_res["test_pred"]
+            )
+            results_folds.append(fold_res)
+
+            if args.save_model:
+                torch.save(
+                    model.state_dict(), out_dir / f"fold_{fold_idx}.pt"
+                )
+            save_results()
+
+        logger.log_summary(n_folds=args.k, split_type="gkf")
+        print(f"\nFinal results: {out_dir / 'results.json'}")
 
 
 if __name__ == "__main__":
