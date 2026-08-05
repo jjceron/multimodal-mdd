@@ -305,7 +305,7 @@ def main() -> None:
         with open(out_dir / "results.json", "w") as f:
             json.dump(results, f, indent=2)
 
-    for fold_idx, (train_loader, val_loader, test_loader) in enumerate(folds):
+    for fold_idx, (train_loader, val_loader, test_loader) in enumerate(folds, start=1):
         print(f"\n=== Fold {fold_idx} ===")
         model = build_model(
             args.model, n_channels, n_classes=2, n_samples=n_samples,
@@ -327,11 +327,9 @@ def main() -> None:
 
         if args.save_model:
             torch.save(
-                model.state_dict(), out_dir / f"{args.model}_fold{fold_idx}.pt"
+                model.state_dict(), out_dir / f"fold_{fold_idx}.pt"
             )
-
         save_results()
-        print(f"[saved fold {fold_idx}] {out_dir / 'results.json'}")
 
     logger.log_summary(n_folds=args.k, split_type="gkf")
     print(f"\nFinal results: {out_dir / 'results.json'}")
