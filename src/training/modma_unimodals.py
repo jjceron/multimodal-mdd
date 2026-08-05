@@ -67,6 +67,49 @@ def normalize_channels(x: torch.Tensor, mean: torch.Tensor,
     return (x - mean[None, :, None]) / (std[None, :, None] + 1e-8)
 
 
+def preprocess(x: torch.Tensor, mean: torch.Tensor, std: torch.Tensor,
+               norm: str) -> tuple[torch.Tensor, int]:
+    """Normalize a batch and flatten subject windows.
+
+    ``norm == "fold"`` uses fold-level per-channel train statistics (current
+    default). ``norm == "subject"`` z-scores each subject by ITS OWN mean/std
+    over its windows/channels/time; because splits are per-subject, a subject
+    never crosses train/test, so there is no leakage.
+    """
+    if norm == "subject":
+        mu = x.mean(dim=(1, 2, 3), keepdim=True)
+        sg = x.std(dim=(1, 2, 3), keepdim=True, unbiased=False)
+        x = (x - mu) / (sg + 1e-8)
+    flat, windows = flatten_batch(x)
+    if norm == "fold":
+        flat = normalize_channels(flat, mean, std)
+    return flat, windows
+
+
+def make_criterion(loss: str, device: str, label_smoothing: float, *,
+                   train_loader=None):
+    """Build the (possibly class-weighted) loss for the given mode."""
+    if loss == "bce":
+        return torch.nn.BCEWithLogitsLoss()
+    cls_counts = torch.bincount(
+        torch.cat([y for _, _, y in train_loader]).long()
+    )
+    cls_weights = (1.0 / cls_counts.float()).to(device)
+    cls_weights = cls_weights / cls_weights.mean()
+    return torch.nn.CrossEntropyLoss(
+        weight=cls_weights, label_smoothing=label_smoothing
+    )
+
+
+def step_loss(criterion, logits: torch.Tensor, yf: torch.Tensor,
+              loss: str) -> torch.Tensor:
+    """Compute loss for the given mode on already-expanded labels."""
+    if loss == "bce":
+        y_smooth = yf.float() * 0.95 + 0.025
+        return criterion(logits[:, 1], y_smooth)
+    return criterion(logits, yf)
+
+
 def expand_labels(y: torch.Tensor, windows: int) -> torch.Tensor:
     """Repeat each subject label once per window."""
     return y.view(-1, 1).repeat(1, windows).reshape(-1)
@@ -113,12 +156,18 @@ def train_fold(
     mean: torch.Tensor,
     std: torch.Tensor,
     label_smoothing: float,
+    loss: str,
+    norm: str,
 ) -> tuple[dict, int]:
-    optimizer = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=weight_decay)
-    cls_counts = torch.bincount(torch.cat([y for _, _, y in train_loader]).long())
-    cls_weights = (1.0 / cls_counts.float()).to(device)
-    cls_weights = cls_weights / cls_weights.mean()
-    criterion = torch.nn.CrossEntropyLoss(weight=cls_weights, label_smoothing=label_smoothing)
+    optimizer = torch.optim.AdamW(
+        model.parameters(), lr=lr, weight_decay=weight_decay
+    )
+    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+        optimizer, mode="max", factor=0.5, patience=10
+    )
+    criterion = make_criterion(
+        loss, device, label_smoothing, train_loader=train_loader
+    )
     history = {
         "train_loss": [],
         "val_loss": [],
@@ -141,15 +190,14 @@ def train_fold(
         model.train()
         tr_loss, tr_correct, tr_total = 0.0, 0, 0
         for _, x, y in train_loader:
-            flat, windows = flatten_batch(x)
-            flat = normalize_channels(flat, mean, std)
+            flat, windows = preprocess(x, mean, std, norm)
             yf = expand_labels(y, windows).to(device)
             optimizer.zero_grad()
             logits = forward_logits(model, flat.to(device))
-            loss = criterion(logits, yf)
-            loss.backward()
+            tloss = step_loss(criterion, logits, yf, loss)
+            tloss.backward()
             optimizer.step()
-            tr_loss += loss.item() * len(yf)
+            tr_loss += tloss.item() * len(yf)
             tr_correct += (logits.argmax(1) == yf).sum().item()
             tr_total += len(yf)
 
@@ -158,11 +206,11 @@ def train_fold(
         val_subj_true, val_subj_pred = [], []
         with torch.no_grad():
             for _, x, y in val_loader:
-                flat, windows = flatten_batch(x)
-                flat = normalize_channels(flat, mean, std)
+                flat, windows = preprocess(x, mean, std, norm)
                 yf = expand_labels(y, windows)
                 logits = forward_logits(model, flat.to(device))
-                val_loss += criterion(logits, yf.to(device)).item() * len(yf)
+                val_loss += step_loss(criterion, logits, yf.to(device),
+                                      loss).item() * len(yf)
                 val_true.extend(yf.tolist())
                 val_pred.extend(logits.argmax(1).cpu().tolist())
                 logits_subj = logits.view(x.shape[0], windows, -1)
@@ -188,6 +236,8 @@ def train_fold(
         history["val_subj_f1"].append(vs_m["f1"])
         history["val_subj_sens"].append(vs_m["sens"])
         history["val_subj_spec"].append(vs_m["spec"])
+
+        scheduler.step(vs_m["bacc"])
 
         if vs_m["bacc"] > best_val_bacc:
             best_val_bacc = vs_m["bacc"]
@@ -232,6 +282,8 @@ def refit_model(
     device: str,
     label_smoothing: float,
     batch_size: int,
+    loss: str,
+    norm: str,
 ) -> tuple[torch.nn.Module, torch.Tensor, torch.Tensor]:
     """Retrain ``model`` on train+val for exactly ``epochs`` epochs (no early stop)."""
     x = torch.cat([train_loader.dataset.X, val_loader.dataset.X])
@@ -248,38 +300,35 @@ def refit_model(
     mean = x.mean(dim=(0, 1, 3))
     std = x.std(dim=(0, 1, 3), unbiased=False)
 
-    cls_counts = torch.bincount(y.long())
-    cls_weights = (1.0 / cls_counts.float()).to(device)
-    cls_weights = cls_weights / cls_weights.mean()
-    criterion = torch.nn.CrossEntropyLoss(
-        weight=cls_weights, label_smoothing=label_smoothing
+    criterion = make_criterion(
+        loss, device, label_smoothing, train_loader=loader
     )
-    optimizer = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=weight_decay)
+    optimizer = torch.optim.AdamW(
+        model.parameters(), lr=lr, weight_decay=weight_decay
+    )
 
     model.train()
     for _ in range(epochs):
         for _, xb, yb in loader:
-            flat, windows = flatten_batch(xb)
-            flat = normalize_channels(flat, mean, std)
+            flat, windows = preprocess(xb, mean, std, norm)
             yf = expand_labels(yb, windows).to(device)
             optimizer.zero_grad()
             logits = forward_logits(model, flat.to(device))
-            loss = criterion(logits, yf)
-            loss.backward()
+            tloss = step_loss(criterion, logits, yf, loss)
+            tloss.backward()
             optimizer.step()
     return model, mean, std
 
 
 def run_fold_test(model: torch.nn.Module, test_loader, device: str,
-                  mean: torch.Tensor, std: torch.Tensor) -> dict:
+                  mean: torch.Tensor, std: torch.Tensor, norm: str) -> dict:
     true_subj, pred_subj, prob_subj = [], [], []
     true_win, pred_win = [], []
 
     model.eval()
     with torch.no_grad():
         for _, x, y in test_loader:
-            flat, windows = flatten_batch(x)
-            flat = normalize_channels(flat, mean, std)
+            flat, windows = preprocess(x, mean, std, norm)
             logits = forward_logits(model, flat.to(device)).cpu()
             logits_subj = logits.view(x.shape[0], windows, -1)
             yf = expand_labels(y, windows)
@@ -311,20 +360,27 @@ def parse_args() -> argparse.Namespace:
                         choices=["eeg", "aud"])
     parser.add_argument("--channels", type=str, default="10-20",
                         choices=["all", "10-20", "f64"])
-    parser.add_argument("--overlap", type=float, default=0.25)
+    parser.add_argument("--overlap", type=float, default=0.5)
     parser.add_argument("--model", type=str, default="cnn_lstm",
                         choices=sorted(MODEL_CLASSES))
+    parser.add_argument("--loss", type=str, default="bce",
+                        choices=["ce", "bce"],
+                        help="Loss: bce (BCE + label smoothing) or ce (weighted CE)")
+    parser.add_argument("--norm", type=str, default="fold",
+                        choices=["fold", "subject"],
+                        help="Normalization: fold (per-channel train stats) "
+                             "or subject (per-subject z-score)")
     parser.add_argument("--k", type=int, default=5)
     parser.add_argument("--inner-splits", type=int, default=5)
     parser.add_argument("--split-seed", type=int, nargs="+", default=[2509])
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--tag", type=str, default="base")
-    parser.add_argument("--epochs", type=int, default=150)
-    parser.add_argument("--batch-size", type=int, default=8)
-    parser.add_argument("--lr", type=float, default=5e-3)
-    parser.add_argument("--weight-decay", type=float, default=3e-4)
-    parser.add_argument("--patience", type=int, default=30)
-    parser.add_argument("--dropout", type=float, default=0.2)
+    parser.add_argument("--epochs", type=int, default=300)
+    parser.add_argument("--batch-size", type=int, default=32)
+    parser.add_argument("--lr", type=float, default=5e-4)
+    parser.add_argument("--weight-decay", type=float, default=5e-3)
+    parser.add_argument("--patience", type=int, default=40)
+    parser.add_argument("--dropout", type=float, default=0.5)
     parser.add_argument("--label-smoothing", type=float, default=0.05)
     parser.add_argument("--refit", action="store_true",
                         help="Retrain final model on train+val before testing")
@@ -405,9 +461,11 @@ def main() -> None:
                 "dropout": args.dropout,
                 "label_smoothing": args.label_smoothing,
                 "patience": args.patience,
-                "class_weighted_loss": True,
+                "class_weighted_loss": args.loss == "ce",
                 "early_stop_on": "val_subject_bacc",
                 "refit": args.refit,
+                "loss": args.loss,
+                "norm": args.norm,
             },
             "model": {
                 "constructor": {
@@ -486,7 +544,7 @@ def main() -> None:
             history, best_epoch = train_fold(
                 model, train_loader, val_loader, args.epochs, args.lr,
                 args.weight_decay, args.patience, device, logger,
-                mean, std, args.label_smoothing,
+                mean, std, args.label_smoothing, args.loss, args.norm,
             )
 
             if args.refit:
@@ -497,14 +555,15 @@ def main() -> None:
                     ).to(device),
                     train_loader, val_loader, best_epoch, args.lr,
                     args.weight_decay, device, args.label_smoothing,
-                    args.batch_size,
+                    args.batch_size, args.loss, args.norm,
                 )
                 train_subjects = (list(train_loader.dataset.names)
                                   + list(val_loader.dataset.names))
             else:
                 train_subjects = list(train_loader.dataset.names)
 
-            fold_res = run_fold_test(model, test_loader, device, mean, std)
+            fold_res = run_fold_test(model, test_loader, device, mean, std,
+                                     args.norm)
             fold_res["fold"] = fold_idx
             fold_res["history"] = history
             fold_res["best_epoch"] = best_epoch
