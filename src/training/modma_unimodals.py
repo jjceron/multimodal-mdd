@@ -17,6 +17,7 @@ import numpy as np
 import sklearn
 import torch
 from sklearn.metrics import roc_auc_score
+from torch.utils.data import DataLoader, Dataset
 
 from src.models.cnn_lstm import CNNLSTM
 from src.models.deepconvnet import DeepConvNet
@@ -112,7 +113,7 @@ def train_fold(
     mean: torch.Tensor,
     std: torch.Tensor,
     label_smoothing: float,
-) -> dict:
+) -> tuple[dict, int]:
     optimizer = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=weight_decay)
     cls_counts = torch.bincount(torch.cat([y for _, _, y in train_loader]).long())
     cls_weights = (1.0 / cls_counts.float()).to(device)
@@ -133,7 +134,7 @@ def train_fold(
         "val_subj_spec": [],
     }
 
-    best_val_bacc, best_state, patience_left = -1.0, None, 0
+    best_val_bacc, best_state, best_epoch, patience_left = -1.0, None, 0, 0
     logger.log_header()
 
     for epoch in range(1, epochs + 1):
@@ -190,6 +191,7 @@ def train_fold(
 
         if vs_m["bacc"] > best_val_bacc:
             best_val_bacc = vs_m["bacc"]
+            best_epoch = epoch
             best_state = {k: v.detach().clone() for k, v in model.state_dict().items()}
             patience_left = 0
         else:
@@ -204,7 +206,68 @@ def train_fold(
 
     if best_state is not None:
         model.load_state_dict(best_state)
-    return history
+    if best_epoch == 0:
+        best_epoch = len(history["train_loss"])
+    return history, best_epoch
+
+
+class _CombinedDataset(Dataset):
+    def __init__(self, x, y, names):
+        self.X, self.y, self.names = x, y, list(names)
+
+    def __len__(self) -> int:
+        return len(self.names)
+
+    def __getitem__(self, idx):
+        return self.names[idx], self.X[idx], self.y[idx]
+
+
+def refit_model(
+    model: torch.nn.Module,
+    train_loader,
+    val_loader,
+    epochs: int,
+    lr: float,
+    weight_decay: float,
+    device: str,
+    label_smoothing: float,
+    batch_size: int,
+) -> tuple[torch.nn.Module, torch.Tensor, torch.Tensor]:
+    """Retrain ``model`` on train+val for exactly ``epochs`` epochs (no early stop)."""
+    x = torch.cat([train_loader.dataset.X, val_loader.dataset.X])
+    y = torch.cat([train_loader.dataset.y, val_loader.dataset.y])
+    names = list(train_loader.dataset.names) + list(val_loader.dataset.names)
+    loader = DataLoader(
+        _CombinedDataset(x, y, names),
+        batch_size=batch_size,
+        shuffle=True,
+        num_workers=0,
+        pin_memory=(device == "cuda"),
+    )
+
+    mean = x.mean(dim=(0, 1, 3))
+    std = x.std(dim=(0, 1, 3), unbiased=False)
+
+    cls_counts = torch.bincount(y.long())
+    cls_weights = (1.0 / cls_counts.float()).to(device)
+    cls_weights = cls_weights / cls_weights.mean()
+    criterion = torch.nn.CrossEntropyLoss(
+        weight=cls_weights, label_smoothing=label_smoothing
+    )
+    optimizer = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=weight_decay)
+
+    model.train()
+    for _ in range(epochs):
+        for _, xb, yb in loader:
+            flat, windows = flatten_batch(xb)
+            flat = normalize_channels(flat, mean, std)
+            yf = expand_labels(yb, windows).to(device)
+            optimizer.zero_grad()
+            logits = forward_logits(model, flat.to(device))
+            loss = criterion(logits, yf)
+            loss.backward()
+            optimizer.step()
+    return model, mean, std
 
 
 def run_fold_test(model: torch.nn.Module, test_loader, device: str,
@@ -263,6 +326,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--patience", type=int, default=30)
     parser.add_argument("--dropout", type=float, default=0.2)
     parser.add_argument("--label-smoothing", type=float, default=0.05)
+    parser.add_argument("--refit", action="store_true",
+                        help="Retrain final model on train+val before testing")
     parser.add_argument("--output-root", type=str, default=str(DEFAULT_OUTPUT_ROOT))
     parser.add_argument("--save-model", action="store_true")
     return parser.parse_args()
@@ -342,6 +407,7 @@ def main() -> None:
                 "patience": args.patience,
                 "class_weighted_loss": True,
                 "early_stop_on": "val_subject_bacc",
+                "refit": args.refit,
             },
             "model": {
                 "constructor": {
@@ -417,16 +483,32 @@ def main() -> None:
                 dropout=args.dropout,
             ).to(device)
 
-            history = train_fold(
+            history, best_epoch = train_fold(
                 model, train_loader, val_loader, args.epochs, args.lr,
                 args.weight_decay, args.patience, device, logger,
                 mean, std, args.label_smoothing,
             )
 
+            if args.refit:
+                model, mean, std = refit_model(
+                    build_model(
+                        args.model, n_channels, n_classes=2, n_samples=n_samples,
+                        dropout=args.dropout,
+                    ).to(device),
+                    train_loader, val_loader, best_epoch, args.lr,
+                    args.weight_decay, device, args.label_smoothing,
+                    args.batch_size,
+                )
+                train_subjects = (list(train_loader.dataset.names)
+                                  + list(val_loader.dataset.names))
+            else:
+                train_subjects = list(train_loader.dataset.names)
+
             fold_res = run_fold_test(model, test_loader, device, mean, std)
             fold_res["fold"] = fold_idx
             fold_res["history"] = history
-            fold_res["train_subjects"] = list(train_loader.dataset.names)
+            fold_res["best_epoch"] = best_epoch
+            fold_res["train_subjects"] = train_subjects
             fold_res["val_subjects"] = list(val_loader.dataset.names)
             fold_res["test_subjects"] = list(test_loader.dataset.names)
             fold_res["test_metrics"] = logger.log_fold_test(
