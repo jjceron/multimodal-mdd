@@ -10,6 +10,7 @@ from __future__ import annotations
 import argparse
 import json
 import platform
+from collections import Counter
 from pathlib import Path
 
 import mne
@@ -224,9 +225,9 @@ def train_fold(
                 val_true.extend(yf.tolist())
                 val_pred.extend(logits.argmax(1).cpu().tolist())
                 logits_subj = logits.view(x.shape[0], windows, -1)
-                votes = logits_subj.argmax(dim=2).mode(dim=1).values
+                subj_prob = logits_subj.softmax(dim=2)[:, :, 1].mean(dim=1)
                 val_subj_true.extend(y.cpu().tolist())
-                val_subj_pred.extend(votes.cpu().tolist())
+                val_subj_pred.extend((subj_prob >= 0.5).long().cpu().tolist())
 
         tr_acc = tr_correct / max(tr_total, 1)
         tr_loss /= max(tr_total, 1)
@@ -403,6 +404,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--label-smoothing", type=float, default=0.05)
     parser.add_argument("--refit", action="store_true",
                         help="Retrain final model on train+val before testing")
+    parser.add_argument("--refit-min-epochs", type=int, default=15,
+                        help="Minimum best_epoch for which refit runs; if "
+                             "best_epoch is below this, keep the best checkpoint "
+                             "from fold training instead of refitting from scratch")
     parser.add_argument("--output-root", type=str, default=str(DEFAULT_OUTPUT_ROOT))
     parser.add_argument("--save-model", action="store_true")
     return parser.parse_args()
@@ -484,6 +489,7 @@ def main() -> None:
                 "early_stop_on": args.early_stop_on,
                 "bce_pos_weight": not args.no_bce_pos_weight,
                 "refit": args.refit,
+                "refit_min_epochs": args.refit_min_epochs,
                 "loss": args.loss,
                 "norm": args.norm,
             },
@@ -556,6 +562,13 @@ def main() -> None:
 
         for fold_idx, (train_loader, val_loader, test_loader) in enumerate(folds, start=1):
             print(f"\n=== Fold {fold_idx} ===")
+            def cls_counts(dl):
+                c = Counter(dl.dataset.y.tolist())
+                return f"{c.get(0, 0)}/{c.get(1, 0)}"
+            print(f"  subjects train={len(train_loader.dataset)} "
+                  f"HC/MDD={cls_counts(train_loader)} | val={len(val_loader.dataset)} "
+                  f"HC/MDD={cls_counts(val_loader)} | test={len(test_loader.dataset)} "
+                  f"HC/MDD={cls_counts(test_loader)}")
             mean, std = channel_stats(train_loader)
             model = build_model(
                 args.model, n_channels, n_classes=2, n_samples=n_samples,
@@ -570,7 +583,7 @@ def main() -> None:
                 bce_pos_weight=not args.no_bce_pos_weight,
             )
 
-            if args.refit:
+            if args.refit and best_epoch >= args.refit_min_epochs:
                 model, mean, std = refit_model(
                     build_model(
                         args.model, n_channels, n_classes=2, n_samples=n_samples,
@@ -581,10 +594,11 @@ def main() -> None:
                     args.batch_size, args.loss, args.norm,
                     bce_pos_weight=not args.no_bce_pos_weight,
                 )
-                train_subjects = (list(train_loader.dataset.names)
-                                  + list(val_loader.dataset.names))
-            else:
-                train_subjects = list(train_loader.dataset.names)
+            train_subjects = (
+                (list(train_loader.dataset.names)
+                 + list(val_loader.dataset.names))
+                if args.refit else list(train_loader.dataset.names)
+            )
 
             fold_res = run_fold_test(model, test_loader, device, mean, std,
                                      args.norm)
