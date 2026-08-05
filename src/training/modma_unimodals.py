@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import platform
 from pathlib import Path
 
 import numpy as np
@@ -25,6 +26,7 @@ from src.utils.training_logger import ClassificationLogger
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_OUTPUT_ROOT = PROJECT_ROOT / "outputs/results/unimodals/eeg"
+NUM_WORKERS = 4 if platform.system() != "Windows" else 0
 
 MODEL_CLASSES = {
     "deepconvnet": DeepConvNet,
@@ -72,6 +74,12 @@ def build_model(
         n_samples=n_samples,
         dropout=dropout,
     )
+
+
+def count_parameters(model: torch.nn.Module) -> tuple[int, int, int]:
+    total = sum(p.numel() for p in model.parameters())
+    trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    return total, trainable, total - trainable
 
 
 def confusion_matrix(true, pred) -> list[list[int]]:
@@ -219,10 +227,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--tag", type=str, default="base")
     parser.add_argument("--epochs", type=int, default=100)
     parser.add_argument("--batch-size", type=int, default=8)
-    parser.add_argument("--lr", type=float, default=3e-4)
+    parser.add_argument("--lr", type=float, default=1e-2)
     parser.add_argument("--weight-decay", type=float, default=1e-4)
     parser.add_argument("--patience", type=int, default=20)
-    parser.add_argument("--dropout", type=float, default=0.5)
+    parser.add_argument("--dropout", type=float, default=0.1)
     parser.add_argument("--output-root", type=str, default=str(DEFAULT_OUTPUT_ROOT))
     parser.add_argument("--save-model", action="store_true")
     return parser.parse_args()
@@ -233,8 +241,7 @@ def main() -> None:
     set_seed(args.seed)
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
-    print(f"[env] seed={args.seed} split_seed={args.split_seed} device={device}")
-
+    
     ds = MODMADataset(channels=args.channels)
     n_channels = len(ds.channel_names)
     n_samples = ds.samples[0]["eeg"].shape[-1]
@@ -245,6 +252,8 @@ def main() -> None:
         inner_split=args.inner_splits,
         split_seed=args.split_seed,
         batch_size=args.batch_size,
+        num_workers=NUM_WORKERS,
+        pin_memory=(device == "cuda"),
     )
 
     out_dir = (
@@ -252,10 +261,49 @@ def main() -> None:
         / f"unimodals_sgkf_{args.modal}_sseed{args.split_seed}_tag{args.tag}"
     )
     out_dir.mkdir(parents=True, exist_ok=True)
-    print(f"[out] {out_dir}")
+
+    windows_per_subject = int(ds.samples[0]["eeg"].shape[0])
+    model_hdr = build_model(
+        args.model, n_channels, n_classes=2, n_samples=n_samples,
+        dropout=args.dropout,
+    )
+    total, trainable, frozen = count_parameters(model_hdr)
+    gpu = torch.cuda.get_device_name(0) if torch.cuda.is_available() else "CPU"
+
+    print("=" * 78)
+    print(f" MODAL / MODEL        : {args.modal} / {args.model}")
+    print(f" DEVICE               : {device}")
+    print(f" GPU                  : {gpu}")
+    print(f" DATASET              : channels={args.channels} ({n_channels}) "
+          f"samples={n_samples} windows/subj={windows_per_subject} "
+          f"subjects={len(ds.samples)}")
+    print(f" INPUT SHAPES         : window [{n_channels}, {n_samples}] | "
+          f"batch [{args.batch_size}, {windows_per_subject}, {n_channels}, {n_samples}] | "
+          f"flatten [{args.batch_size * windows_per_subject}, {n_channels}, {n_samples}]")
+    print(f" TRAINING CONFIG      : k={args.k} inner={args.inner_splits} "
+          f"split_seed={args.split_seed} seed={args.seed} epochs={args.epochs} "
+          f"batch={args.batch_size} lr={args.lr} wd={args.weight_decay} "
+          f"dropout={args.dropout} patience={args.patience}")
+    print(f" MODEL PARAMS         : total={total:,} trainable={trainable:,} frozen={frozen:,}")
+    print("=" * 78)
 
     logger = ClassificationLogger()
     results_folds = []
+
+    def save_results() -> None:
+        results = {
+            "modal": args.modal,
+            "tag": args.tag,
+            "split_seed": args.split_seed,
+            "seed": args.seed,
+            "channels": args.channels,
+            "model": args.model,
+            "n_channels": n_channels,
+            "n_samples": n_samples,
+            "folds": results_folds,
+        }
+        with open(out_dir / "results.json", "w") as f:
+            json.dump(results, f, indent=2)
 
     for fold_idx, (train_loader, val_loader, test_loader) in enumerate(folds):
         print(f"\n=== Fold {fold_idx} ===")
@@ -282,21 +330,11 @@ def main() -> None:
                 model.state_dict(), out_dir / f"{args.model}_fold{fold_idx}.pt"
             )
 
-    logger.log_summary(n_folds=args.k, split_type="gkf")
+        save_results()
+        print(f"[saved fold {fold_idx}] {out_dir / 'results.json'}")
 
-    results = {
-        "tag": args.tag,
-        "split_seed": args.split_seed,
-        "seed": args.seed,
-        "channels": args.channels,
-        "model": args.model,
-        "n_channels": n_channels,
-        "n_samples": n_samples,
-        "folds": results_folds,
-    }
-    with open(out_dir / "results.json", "w") as f:
-        json.dump(results, f, indent=2)
-    print(f"\nSaved results: {out_dir / 'results.json'}")
+    logger.log_summary(n_folds=args.k, split_type="gkf")
+    print(f"\nFinal results: {out_dir / 'results.json'}")
 
 
 if __name__ == "__main__":
