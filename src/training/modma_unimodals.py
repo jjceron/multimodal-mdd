@@ -12,7 +12,9 @@ import json
 import platform
 from pathlib import Path
 
+import mne
 import numpy as np
+import sklearn
 import torch
 from sklearn.metrics import roc_auc_score
 
@@ -125,6 +127,10 @@ def train_fold(
         "val_f1": [],
         "val_sens": [],
         "val_spec": [],
+        "val_subj_bacc": [],
+        "val_subj_f1": [],
+        "val_subj_sens": [],
+        "val_subj_spec": [],
     }
 
     best_val_bacc, best_state, patience_left = -1.0, None, 0
@@ -177,6 +183,10 @@ def train_fold(
         history["val_f1"].append(vl_m["f1"])
         history["val_sens"].append(vl_m["sens"])
         history["val_spec"].append(vl_m["spec"])
+        history["val_subj_bacc"].append(vs_m["bacc"])
+        history["val_subj_f1"].append(vs_m["f1"])
+        history["val_subj_sens"].append(vs_m["sens"])
+        history["val_subj_spec"].append(vs_m["spec"])
 
         if vs_m["bacc"] > best_val_bacc:
             best_val_bacc = vs_m["bacc"]
@@ -295,6 +305,68 @@ def main() -> None:
         )
         out_dir.mkdir(parents=True, exist_ok=True)
 
+        config = {
+            "identity": {
+                "modal": args.modal,
+                "model": args.model,
+                "tag": args.tag,
+                "output_dir": str(out_dir),
+            },
+            "data": {
+                "root": str(ds.root),
+                "channel_names": ds.channel_names,
+                "n_subjects": len(ds.samples),
+                "n_channels": n_channels,
+                "n_samples": n_samples,
+                "windows_per_subject": windows,
+                "window_sec": ds.window_sec,
+                "overlap": args.overlap,
+                "lowcut": ds.lowcut,
+                "highcut": ds.highcut,
+                "notch": ds.notch,
+                "target_fs": ds.target_fs,
+            },
+            "cv": {
+                "k": args.k,
+                "inner_splits": args.inner_splits,
+                "split_seed": split_seed,
+                "shuffle": True,
+            },
+            "training": {
+                "epochs": args.epochs,
+                "batch_size": args.batch_size,
+                "lr": args.lr,
+                "weight_decay": args.weight_decay,
+                "dropout": args.dropout,
+                "label_smoothing": args.label_smoothing,
+                "patience": args.patience,
+                "class_weighted_loss": True,
+                "early_stop_on": "val_subject_bacc",
+            },
+            "model": {
+                "constructor": {
+                    "name": args.model,
+                    "n_channels": n_channels,
+                    "n_classes": 2,
+                    "n_samples": n_samples,
+                    "dropout": args.dropout,
+                },
+                "total_params": total,
+                "trainable_params": trainable,
+                "frozen_params": frozen,
+            },
+            "environment": {
+                "device": device,
+                "gpu": gpu,
+                "python": platform.python_version(),
+                "torch": torch.__version__,
+                "numpy": np.__version__,
+                "sklearn": sklearn.__version__,
+                "mne": mne.__version__,
+            },
+            "cli": vars(args),
+        }
+
         print("=" * 78)
         print(f" MODAL / MODEL        : {args.modal} / {args.model}")
         print(f" DEVICE               : {device}")
@@ -316,7 +388,12 @@ def main() -> None:
         logger = ClassificationLogger()
         results_folds = []
 
-        def save_results() -> None:
+        def save_results(
+            split_seed=split_seed,
+            config=config,
+            results_folds=results_folds,
+            out_dir=out_dir,
+        ) -> None:
             results = {
                 "modal": args.modal,
                 "tag": args.tag,
@@ -326,6 +403,7 @@ def main() -> None:
                 "model": args.model,
                 "n_channels": n_channels,
                 "n_samples": n_samples,
+                "config": config,
                 "folds": results_folds,
             }
             with open(out_dir / "results.json", "w") as f:
@@ -348,6 +426,9 @@ def main() -> None:
             fold_res = run_fold_test(model, test_loader, device, mean, std)
             fold_res["fold"] = fold_idx
             fold_res["history"] = history
+            fold_res["train_subjects"] = list(train_loader.dataset.names)
+            fold_res["val_subjects"] = list(val_loader.dataset.names)
+            fold_res["test_subjects"] = list(test_loader.dataset.names)
             fold_res["test_metrics"] = logger.log_fold_test(
                 fold_res["test_true"], fold_res["test_pred"]
             )
@@ -358,6 +439,9 @@ def main() -> None:
                     model.state_dict(), out_dir / f"fold_{fold_idx}.pt"
                 )
             save_results()
+
+            del model
+            torch.cuda.empty_cache()
 
         logger.log_summary(n_folds=args.k, split_type="gkf")
         print(f"\nFinal results: {out_dir / 'results.json'}")
