@@ -262,7 +262,7 @@ def parse_args():
     parser.add_argument("--channels", type=str, default="10-20")
     parser.add_argument("--k", type=int, default=5)
     parser.add_argument("--inner-splits", type=int, default=5)
-    parser.add_argument("--batch-size", type=int, default=32)
+    parser.add_argument("--batch-size", type=int, default=16)
     parser.add_argument("--lowcut", type=float, default=0.5)
     parser.add_argument("--highcut", type=float, default=50.0)
     parser.add_argument("--notch", type=float, default=50.0)
