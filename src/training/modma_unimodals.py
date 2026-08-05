@@ -112,7 +112,10 @@ def train_fold(
     label_smoothing: float,
 ) -> dict:
     optimizer = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=weight_decay)
-    criterion = torch.nn.CrossEntropyLoss(label_smoothing=label_smoothing)
+    cls_counts = torch.bincount(torch.cat([y for _, _, y in train_loader]).long())
+    cls_weights = (1.0 / cls_counts.float()).to(device)
+    cls_weights = cls_weights / cls_weights.mean()
+    criterion = torch.nn.CrossEntropyLoss(weight=cls_weights, label_smoothing=label_smoothing)
     history = {
         "train_loss": [],
         "val_loss": [],
@@ -243,13 +246,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--split-seed", type=int, default=2509)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--tag", type=str, default="base")
-    parser.add_argument("--epochs", type=int, default=100)
+    parser.add_argument("--epochs", type=int, default=150)
     parser.add_argument("--batch-size", type=int, default=8)
-    parser.add_argument("--lr", type=float, default=1e-2)
-    parser.add_argument("--weight-decay", type=float, default=1e-3)
-    parser.add_argument("--patience", type=int, default=20)
-    parser.add_argument("--dropout", type=float, default=0.3)
-    parser.add_argument("--label-smoothing", type=float, default=0.1)
+    parser.add_argument("--lr", type=float, default=5e-3)
+    parser.add_argument("--weight-decay", type=float, default=3e-4)
+    parser.add_argument("--patience", type=int, default=30)
+    parser.add_argument("--dropout", type=float, default=0.2)
+    parser.add_argument("--label-smoothing", type=float, default=0.05)
     parser.add_argument("--output-root", type=str, default=str(DEFAULT_OUTPUT_ROOT))
     parser.add_argument("--save-model", action="store_true")
     return parser.parse_args()
@@ -270,7 +273,7 @@ def main() -> None:
         k_folder=args.k,
         inner_split=args.inner_splits,
         split_seed=args.split_seed,
-        batch_size=args.batch_size,
+        batch_size=BATCH_SIZE,
         num_workers=NUM_WORKERS,
         pin_memory=(device == "cuda"),
     )
