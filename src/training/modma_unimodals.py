@@ -87,10 +87,17 @@ def preprocess(x: torch.Tensor, mean: torch.Tensor, std: torch.Tensor,
 
 
 def make_criterion(loss: str, device: str, label_smoothing: float, *,
-                   train_loader=None):
-    """Build the (possibly class-weighted) loss for the given mode."""
+                   train_loader=None, bce_pos_weight: bool = True):
+    """Build the (possibly class-weighted) criterion for the given mode."""
     if loss == "bce":
-        return torch.nn.BCEWithLogitsLoss()
+        pos_weight = None
+        if bce_pos_weight and train_loader is not None:
+            cls_counts = torch.bincount(
+                torch.cat([y for _, _, y in train_loader]).long()
+            )
+            if cls_counts.numel() > 1 and float(cls_counts[1]) > 0:
+                pos_weight = (cls_counts[0].float() / cls_counts[1].float()).to(device)
+        return torch.nn.BCEWithLogitsLoss(pos_weight=pos_weight)
     cls_counts = torch.bincount(
         torch.cat([y for _, _, y in train_loader]).long()
     )
@@ -158,6 +165,8 @@ def train_fold(
     label_smoothing: float,
     loss: str,
     norm: str,
+    early_stop_on: str = "window-bacc",
+    bce_pos_weight: bool = True,
 ) -> tuple[dict, int]:
     optimizer = torch.optim.AdamW(
         model.parameters(), lr=lr, weight_decay=weight_decay
@@ -166,7 +175,8 @@ def train_fold(
         optimizer, mode="max", factor=0.5, patience=10
     )
     criterion = make_criterion(
-        loss, device, label_smoothing, train_loader=train_loader
+        loss, device, label_smoothing, train_loader=train_loader,
+        bce_pos_weight=bce_pos_weight,
     )
     history = {
         "train_loss": [],
@@ -237,10 +247,11 @@ def train_fold(
         history["val_subj_sens"].append(vs_m["sens"])
         history["val_subj_spec"].append(vs_m["spec"])
 
-        scheduler.step(vs_m["bacc"])
+        es_metric = vs_m["bacc"] if early_stop_on == "subject-bacc" else vl_m["bacc"]
+        scheduler.step(es_metric)
 
-        if vs_m["bacc"] > best_val_bacc:
-            best_val_bacc = vs_m["bacc"]
+        if es_metric > best_val_bacc:
+            best_val_bacc = es_metric
             best_epoch = epoch
             best_state = {k: v.detach().clone() for k, v in model.state_dict().items()}
             patience_left = 0
@@ -284,6 +295,7 @@ def refit_model(
     batch_size: int,
     loss: str,
     norm: str,
+    bce_pos_weight: bool = True,
 ) -> tuple[torch.nn.Module, torch.Tensor, torch.Tensor]:
     """Retrain ``model`` on train+val for exactly ``epochs`` epochs (no early stop)."""
     x = torch.cat([train_loader.dataset.X, val_loader.dataset.X])
@@ -301,7 +313,8 @@ def refit_model(
     std = x.std(dim=(0, 1, 3), unbiased=False)
 
     criterion = make_criterion(
-        loss, device, label_smoothing, train_loader=loader
+        loss, device, label_smoothing, train_loader=loader,
+        bce_pos_weight=bce_pos_weight,
     )
     optimizer = torch.optim.AdamW(
         model.parameters(), lr=lr, weight_decay=weight_decay
@@ -335,10 +348,9 @@ def run_fold_test(model: torch.nn.Module, test_loader, device: str,
             true_win.extend(yf.tolist())
             pred_win.extend(logits.argmax(1).tolist())
 
-            votes = logits_subj.argmax(dim=2).mode(dim=1).values
             prob = logits_subj.softmax(dim=2)[:, :, 1].mean(dim=1)
             true_subj.extend(y.numpy().tolist())
-            pred_subj.extend(votes.numpy().tolist())
+            pred_subj.extend((prob >= 0.5).long().numpy().tolist())
             prob_subj.extend(prob.numpy().tolist())
 
     true, pred = np.asarray(true_subj), np.asarray(pred_subj)
@@ -370,6 +382,13 @@ def parse_args() -> argparse.Namespace:
                         choices=["fold", "subject"],
                         help="Normalization: fold (per-channel train stats) "
                              "or subject (per-subject z-score)")
+    parser.add_argument("--early-stop-on", type=str, default="window-bacc",
+                        choices=["subject-bacc", "window-bacc"],
+                        help="Validation signal for scheduler + best-epoch "
+                             "selection: subject-bacc (subject majority vote) "
+                             "or window-bacc (window-level, more samples)")
+    parser.add_argument("--no-bce-pos-weight", action="store_true",
+                        help="Disable class-balanced pos_weight in BCE")
     parser.add_argument("--k", type=int, default=5)
     parser.add_argument("--inner-splits", type=int, default=5)
     parser.add_argument("--split-seed", type=int, nargs="+", default=[2509])
@@ -462,7 +481,8 @@ def main() -> None:
                 "label_smoothing": args.label_smoothing,
                 "patience": args.patience,
                 "class_weighted_loss": args.loss == "ce",
-                "early_stop_on": "val_subject_bacc",
+                "early_stop_on": args.early_stop_on,
+                "bce_pos_weight": not args.no_bce_pos_weight,
                 "refit": args.refit,
                 "loss": args.loss,
                 "norm": args.norm,
@@ -505,7 +525,8 @@ def main() -> None:
               f"split_seed={split_seed} seed={args.seed} epochs={args.epochs} "
               f"batch={args.batch_size} lr={args.lr} wd={args.weight_decay} "
               f"dropout={args.dropout} label_smoothing={args.label_smoothing} "
-              f"patience={args.patience}")
+              f"patience={args.patience} es={args.early_stop_on} "
+              f"bce_pw={not args.no_bce_pos_weight}")
         print(f" MODEL PARAMS         : total={total:,} trainable={trainable:,} frozen={frozen:,}")
         print("=" * 78)
 
@@ -545,6 +566,8 @@ def main() -> None:
                 model, train_loader, val_loader, args.epochs, args.lr,
                 args.weight_decay, args.patience, device, logger,
                 mean, std, args.label_smoothing, args.loss, args.norm,
+                early_stop_on=args.early_stop_on,
+                bce_pos_weight=not args.no_bce_pos_weight,
             )
 
             if args.refit:
@@ -556,6 +579,7 @@ def main() -> None:
                     train_loader, val_loader, best_epoch, args.lr,
                     args.weight_decay, device, args.label_smoothing,
                     args.batch_size, args.loss, args.norm,
+                    bce_pos_weight=not args.no_bce_pos_weight,
                 )
                 train_subjects = (list(train_loader.dataset.names)
                                   + list(val_loader.dataset.names))
