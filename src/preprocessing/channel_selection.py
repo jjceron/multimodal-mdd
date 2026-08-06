@@ -6,7 +6,7 @@ import numpy as np
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 EEG_DIR = PROJECT_ROOT / "data/raw/modma/eeg/EEG_LZU_2015_2_resting state"
 
-SUPPORTED_PRESETS = ("all", "10-20", "f64")
+SUPPORTED_PRESETS = ("all", "10-20", "f64", "29")
 
 CLINICAL_10_20_EGI_MAP = {
     "Fp1": 45, "Fp2": 33, "F7": 69, "F3": 59, "Fz": 30, "F4": 19, "F8": 21,
@@ -15,6 +15,23 @@ CLINICAL_10_20_EGI_MAP = {
 }
 CLINICAL_10_20_NAMES = tuple(CLINICAL_10_20_EGI_MAP)
 CLINICAL_10_20_EGI = tuple(sorted(CLINICAL_10_20_EGI_MAP.values()))
+
+# 29-channel fronto-centro-parietal set (10-20 + 10-10 extended), replicating
+# the channel count used by Yousufi et al. (Brain Sci 2024, brainsci-14-01018),
+# who select 29 frontal/temporal/parietal channels per Hussain et al. The paper
+# never names the 29 channels, so we fix a principled classic 10-20/10-10 set:
+# the 19 standard 10-20 channels plus FC1 FC2 FC5 FC6 C5 C6 CP1 CP2 CP5 CP6.
+# Each extra 10-10 position was placed by spherical interpolation between its
+# verified 10-20 anchors and mapped to the nearest *unused* EGI-128 sensor
+# (mean placement error ~1.7 cm, on par with the standard 10-20 assignments).
+EXTENDED_29_EGI_MAP = {
+    **CLINICAL_10_20_EGI_MAP,
+    "FC1": 53, "FC2": 12, "FC5": 65, "FC6": 22,
+    "C5": 70, "C6": 17,
+    "CP1": 78, "CP2": 111, "CP5": 75, "CP6": 9,
+}
+EXTENDED_29_NAMES = tuple(EXTENDED_29_EGI_MAP)
+EXTENDED_29_EGI = tuple(sorted(EXTENDED_29_EGI_MAP.values()))
 
 _10_20_TARGETS = {
     "Fp1": (-2.7, 6.2, 1.8), "Fp2": (2.7, 6.2, 1.8),
@@ -37,6 +54,8 @@ def select_channel_indices(preset: str) -> list[int]:
         return list(range(64))
     if preset == "10-20":
         return list(CLINICAL_10_20_EGI)
+    if preset == "29":
+        return list(EXTENDED_29_EGI)
     raise ValueError(f"Unknown preset: {preset!r}. Use one of {SUPPORTED_PRESETS}")
 
 
@@ -124,6 +143,11 @@ def main() -> None:
             _print_verification(_find_electrodes_path())
         except FileNotFoundError as e:
             print(f"\n  WARNING: could not verify against dataset: {e}")
+
+    if args.channels == "29":
+        print("\n  Extended 29-channel mapping (name -> EGI channel):")
+        for name in EXTENDED_29_NAMES:
+            print(f"    {name:>4s} -> E{EXTENDED_29_EGI_MAP[name] + 1}")
 
 
 if __name__ == "__main__":

@@ -22,6 +22,7 @@ from torch.utils.data import DataLoader, Dataset
 
 from src.models.cnn_lstm import CNNLSTM
 from src.models.deepconvnet import DeepConvNet
+from src.models.deepconvnet_stft import DeepConvNetSTFT
 from src.models.eegnet import EEGNet
 from src.models.shallowconvnet import ShallowConvNet
 from src.preprocessing.modma_eeg import MODMADataset, create_dataloaders
@@ -34,6 +35,7 @@ NUM_WORKERS = 4 if platform.system() != "Windows" else 0
 
 MODEL_CLASSES = {
     "deepconvnet": DeepConvNet,
+    "deepconvnet_stft": DeepConvNetSTFT,
     "shallowconvnet": ShallowConvNet,
     "cnn_lstm": CNNLSTM,
     "eegnet": EEGNet,
@@ -49,23 +51,29 @@ def forward_logits(model: torch.nn.Module, x: torch.Tensor) -> torch.Tensor:
 
 
 def flatten_batch(x: torch.Tensor) -> tuple[torch.Tensor, int]:
-    """Flatten subject windows into the batch dimension."""
-    n_subjects, windows, channels, samples = x.shape
-    return x.reshape(n_subjects * windows, channels, samples), windows
+    """Flatten subject windows into the batch dimension.
+
+    Handles both time windows ``[S, W, C, T]`` and STFT windows
+    ``[S, W, C, F, T]``; trailing per-window dims are preserved.
+    """
+    n_subjects, windows = x.shape[0], x.shape[1]
+    return x.reshape(n_subjects * windows, *x.shape[2:]), windows
 
 
 def channel_stats(loader):
     """Per-channel mean/std over ALL train windows of a fold (no leakage)."""
-    x = loader.dataset.X  # [S, W, C, T]
-    mean = x.mean(dim=(0, 1, 3))
-    std = x.std(dim=(0, 1, 3), unbiased=False)
+    x = loader.dataset.X  # [S, W, C, ...]
+    reduce_dims = tuple(d for d in range(x.dim()) if d != 2)
+    mean = x.mean(dim=reduce_dims)
+    std = x.std(dim=reduce_dims, unbiased=False)
     return mean, std
 
 
 def normalize_channels(x: torch.Tensor, mean: torch.Tensor,
                        std: torch.Tensor) -> torch.Tensor:
     """Apply per-channel z-score using fold-level train statistics."""
-    return (x - mean[None, :, None]) / (std[None, :, None] + 1e-8)
+    shape = [1, -1] + [1] * (x.dim() - 2)
+    return (x - mean.view(shape)) / (std.view(shape) + 1e-8)
 
 
 def preprocess(x: torch.Tensor, mean: torch.Tensor, std: torch.Tensor,
@@ -74,12 +82,13 @@ def preprocess(x: torch.Tensor, mean: torch.Tensor, std: torch.Tensor,
 
     ``norm == "fold"`` uses fold-level per-channel train statistics (current
     default). ``norm == "subject"`` z-scores each subject by ITS OWN mean/std
-    over its windows/channels/time; because splits are per-subject, a subject
-    never crosses train/test, so there is no leakage.
+    over its windows/channels/(time|freq/time); because splits are per-subject,
+    a subject never crosses train/test, so there is no leakage.
     """
     if norm == "subject":
-        mu = x.mean(dim=(1, 2, 3), keepdim=True)
-        sg = x.std(dim=(1, 2, 3), keepdim=True, unbiased=False)
+        dims = tuple(range(1, x.dim()))
+        mu = x.mean(dim=dims, keepdim=True)
+        sg = x.std(dim=dims, keepdim=True, unbiased=False)
         x = (x - mu) / (sg + 1e-8)
     flat, windows = flatten_batch(x)
     if norm == "fold":
@@ -130,11 +139,25 @@ def subject_prob(logits: torch.Tensor, n_subjects: int, windows: int) -> torch.T
 
 
 def build_model(
-    name: str, n_channels: int, n_classes: int, n_samples: int, dropout: float
+    name: str,
+    n_channels: int,
+    n_classes: int,
+    n_samples: int,
+    dropout: float,
+    n_freq: int | None = None,
 ) -> torch.nn.Module:
     cls = MODEL_CLASSES[name]
     if name == "eegnet":
         return cls(n_channels=n_channels, n_classes=n_classes, dropout=dropout)
+    if name == "deepconvnet_stft":
+        # for STFT input, ``n_samples`` carries the spectrogram time frames
+        return cls(
+            n_channels=n_channels,
+            n_classes=n_classes,
+            n_freq=n_freq,
+            n_time=n_samples,
+            dropout=dropout,
+        )
     return cls(
         n_channels=n_channels,
         n_classes=n_classes,
@@ -315,8 +338,9 @@ def refit_model(
         pin_memory=(device == "cuda"),
     )
 
-    mean = x.mean(dim=(0, 1, 3))
-    std = x.std(dim=(0, 1, 3), unbiased=False)
+    reduce_dims = tuple(d for d in range(x.dim()) if d != 2)
+    mean = x.mean(dim=reduce_dims)
+    std = x.std(dim=reduce_dims, unbiased=False)
 
     criterion = make_criterion(
         loss, device, label_smoothing, train_loader=loader,
@@ -376,8 +400,25 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--modal", type=str, default="eeg",
                         choices=["eeg", "aud"])
     parser.add_argument("--channels", type=str, default="10-20",
-                        choices=["all", "10-20", "f64"])
+                        choices=["all", "10-20", "f64", "29"])
     parser.add_argument("--overlap", type=float, default=0.5)
+    parser.add_argument("--representation", type=str, default="time",
+                        choices=["time", "stft"],
+                        help="Input representation: raw time windows or 2D "
+                             "log-magnitude STFT spectrograms")
+    parser.add_argument("--reference", type=str, default="average",
+                        choices=["average", "cz"],
+                        help="EEG reference (cz requires Cz in the channels)")
+    parser.add_argument("--n-fft", type=int, default=256,
+                        help="STFT window size (samples)")
+    parser.add_argument("--hop", type=int, default=32,
+                        help="STFT hop length (samples)")
+    parser.add_argument("--baseline-correction", action="store_true",
+                        help="Subtract each window's per-channel mean "
+                             "(sliding-window baseline correction)")
+    parser.add_argument("--lowcut", type=float, default=0.5)
+    parser.add_argument("--highcut", type=float, default=60.0)
+    parser.add_argument("--notch", type=float, default=50.0)
     parser.add_argument("--model", type=str, default="cnn_lstm",
                         choices=sorted(MODEL_CLASSES))
     parser.add_argument("--loss", type=str, default="bce",
@@ -423,14 +464,29 @@ def main() -> None:
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
     
-    ds = MODMADataset(channels=args.channels, overlap=args.overlap)
+    ds = MODMADataset(
+        channels=args.channels,
+        overlap=args.overlap,
+        lowcut=args.lowcut,
+        highcut=args.highcut,
+        notch=args.notch,
+        reference=args.reference,
+        representation=args.representation,
+        n_fft=args.n_fft,
+        hop=args.hop,
+        baseline_correction=args.baseline_correction,
+    )
     n_channels = len(ds.channel_names)
+    # window shape: [W, C, T] (time) or [W, C, F, T] (stft)
     n_samples = ds.samples[0]["eeg"].shape[-1]
+    n_freq = (
+        ds.samples[0]["eeg"].shape[2] if args.representation == "stft" else None
+    )
 
     windows = int(ds.samples[0]["eeg"].shape[0])
     model_hdr = build_model(
         args.model, n_channels, n_classes=2, n_samples=n_samples,
-        dropout=args.dropout,
+        dropout=args.dropout, n_freq=n_freq,
     )
     total, trainable, frozen = count_parameters(model_hdr)
     gpu = torch.cuda.get_device_name(0) if torch.cuda.is_available() else "CPU"
@@ -474,6 +530,12 @@ def main() -> None:
                 "highcut": ds.highcut,
                 "notch": ds.notch,
                 "target_fs": ds.target_fs,
+                "reference": ds.reference,
+                "representation": ds.representation,
+                "n_fft": ds.n_fft,
+                "hop": ds.hop,
+                "baseline_correction": ds.baseline_correction,
+                "n_freq": n_freq,
             },
             "cv": {
                 "k": args.k,
@@ -503,6 +565,7 @@ def main() -> None:
                     "n_channels": n_channels,
                     "n_classes": 2,
                     "n_samples": n_samples,
+                    "n_freq": n_freq,
                     "dropout": args.dropout,
                 },
                 "total_params": total,
@@ -528,9 +591,11 @@ def main() -> None:
         print(f" DATASET              : channels={args.channels} ({n_channels}) "
               f"samples={n_samples} windows/subj={windows} "
               f"overlap={args.overlap} subjects={len(ds.samples)}")
-        print(f" INPUT SHAPES         : window [{n_channels}, {n_samples}] | "
-              f"batch [{args.batch_size}, {windows}, {n_channels}, {n_samples}] | "
-              f"flatten [{args.batch_size * windows}, {n_channels}, {n_samples}]")
+        win_shape = tuple(ds.samples[0]["eeg"].shape[1:])
+        flat_shape = (args.batch_size * windows, *win_shape)
+        print(f" INPUT SHAPES         : representation={args.representation} | "
+              f"window {win_shape} | batch {(args.batch_size, windows, *win_shape)} | "
+              f"flatten {flat_shape}")
         print(f" TRAINING CONFIG      : k={args.k} inner={args.inner_splits} "
               f"split_seed={split_seed} seed={args.seed} epochs={args.epochs} "
               f"batch={args.batch_size} lr={args.lr} wd={args.weight_decay} "
@@ -576,7 +641,7 @@ def main() -> None:
             mean, std = channel_stats(train_loader)
             model = build_model(
                 args.model, n_channels, n_classes=2, n_samples=n_samples,
-                dropout=args.dropout,
+                dropout=args.dropout, n_freq=n_freq,
             ).to(device)
 
             history, best_epoch = train_fold(
@@ -591,7 +656,7 @@ def main() -> None:
                 model, mean, std = refit_model(
                     build_model(
                         args.model, n_channels, n_classes=2, n_samples=n_samples,
-                        dropout=args.dropout,
+                        dropout=args.dropout, n_freq=n_freq,
                     ).to(device),
                     train_loader, val_loader, args.refit_epochs, args.lr,
                     args.weight_decay, device, args.label_smoothing,
