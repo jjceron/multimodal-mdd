@@ -123,6 +123,17 @@ def expand_labels(y: torch.Tensor, windows: int) -> torch.Tensor:
     return y.view(-1, 1).repeat(1, windows).reshape(-1)
 
 
+def subject_logits(logits: torch.Tensor, n_subjects: int,
+                   windows: int) -> torch.Tensor:
+    """Aggregate window logits to one logit vector per subject (mean in logit space)."""
+    return logits.view(n_subjects, windows, -1).mean(dim=1)
+
+
+def subject_prob(logits: torch.Tensor, n_subjects: int, windows: int) -> torch.Tensor:
+    """Per-subject class-1 probability via mean(logits) then softmax."""
+    return subject_logits(logits, n_subjects, windows).softmax(dim=1)[:, 1]
+
+
 def build_model(
     name: str, n_channels: int, n_classes: int, n_samples: int, dropout: float
 ) -> torch.nn.Module:
@@ -168,12 +179,14 @@ def train_fold(
     norm: str,
     early_stop_on: str = "window-bacc",
     bce_pos_weight: bool = True,
+    aggregation: str = "window",
+    scheduler_patience: int = 15,
 ) -> tuple[dict, int]:
     optimizer = torch.optim.AdamW(
         model.parameters(), lr=lr, weight_decay=weight_decay
     )
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
-        optimizer, mode="max", factor=0.5, patience=10
+        optimizer, mode="max", factor=0.5, patience=scheduler_patience
     )
     criterion = make_criterion(
         loss, device, label_smoothing, train_loader=train_loader,
@@ -202,15 +215,29 @@ def train_fold(
         tr_loss, tr_correct, tr_total = 0.0, 0, 0
         for _, x, y in train_loader:
             flat, windows = preprocess(x, mean, std, norm)
-            yf = expand_labels(y, windows).to(device)
             optimizer.zero_grad()
             logits = forward_logits(model, flat.to(device))
-            tloss = step_loss(criterion, logits, yf, loss)
-            tloss.backward()
-            optimizer.step()
-            tr_loss += tloss.item() * len(yf)
-            tr_correct += (logits.argmax(1) == yf).sum().item()
-            tr_total += len(yf)
+            if aggregation == "subject":
+                subj = subject_logits(logits, x.shape[0], windows)
+                ty = y.to(device)
+                if loss == "bce":
+                    y_smooth = ty.float() * 0.95 + 0.025
+                    tloss = criterion(subj[:, 1], y_smooth)
+                else:
+                    tloss = criterion(subj, ty)
+                tloss.backward()
+                optimizer.step()
+                tr_loss += tloss.item() * len(ty)
+                tr_correct += (subj.argmax(1) == ty).sum().item()
+                tr_total += len(ty)
+            else:
+                yf = expand_labels(y, windows).to(device)
+                tloss = step_loss(criterion, logits, yf, loss)
+                tloss.backward()
+                optimizer.step()
+                tr_loss += tloss.item() * len(yf)
+                tr_correct += (logits.argmax(1) == yf).sum().item()
+                tr_total += len(yf)
 
         model.eval()
         val_loss, val_true, val_pred = 0.0, [], []
@@ -224,8 +251,7 @@ def train_fold(
                                       loss).item() * len(yf)
                 val_true.extend(yf.tolist())
                 val_pred.extend(logits.argmax(1).cpu().tolist())
-                logits_subj = logits.view(x.shape[0], windows, -1)
-                subj_prob = logits_subj.softmax(dim=2)[:, :, 1].mean(dim=1)
+                subj_prob = subject_prob(logits, x.shape[0], windows)
                 val_subj_true.extend(y.cpu().tolist())
                 val_subj_pred.extend((subj_prob >= 0.5).long().cpu().tolist())
 
@@ -297,6 +323,7 @@ def refit_model(
     loss: str,
     norm: str,
     bce_pos_weight: bool = True,
+    aggregation: str = "window",
 ) -> tuple[torch.nn.Module, torch.Tensor, torch.Tensor]:
     """Retrain ``model`` on train+val for exactly ``epochs`` epochs (no early stop)."""
     x = torch.cat([train_loader.dataset.X, val_loader.dataset.X])
@@ -325,10 +352,19 @@ def refit_model(
     for _ in range(epochs):
         for _, xb, yb in loader:
             flat, windows = preprocess(xb, mean, std, norm)
-            yf = expand_labels(yb, windows).to(device)
             optimizer.zero_grad()
             logits = forward_logits(model, flat.to(device))
-            tloss = step_loss(criterion, logits, yf, loss)
+            if aggregation == "subject":
+                subj = subject_logits(logits, xb.shape[0], windows)
+                ty = yb.to(device)
+                if loss == "bce":
+                    y_smooth = ty.float() * 0.95 + 0.025
+                    tloss = criterion(subj[:, 1], y_smooth)
+                else:
+                    tloss = criterion(subj, ty)
+            else:
+                yf = expand_labels(yb, windows).to(device)
+                tloss = step_loss(criterion, logits, yf, loss)
             tloss.backward()
             optimizer.step()
     return model, mean, std
@@ -344,12 +380,11 @@ def run_fold_test(model: torch.nn.Module, test_loader, device: str,
         for _, x, y in test_loader:
             flat, windows = preprocess(x, mean, std, norm)
             logits = forward_logits(model, flat.to(device)).cpu()
-            logits_subj = logits.view(x.shape[0], windows, -1)
             yf = expand_labels(y, windows)
             true_win.extend(yf.tolist())
             pred_win.extend(logits.argmax(1).tolist())
 
-            prob = logits_subj.softmax(dim=2)[:, :, 1].mean(dim=1)
+            prob = subject_prob(logits, x.shape[0], windows)
             true_subj.extend(y.numpy().tolist())
             pred_subj.extend((prob >= 0.5).long().numpy().tolist())
             prob_subj.extend(prob.numpy().tolist())
@@ -386,6 +421,14 @@ def parse_args() -> argparse.Namespace:
                         choices=["fold", "subject"],
                         help="Normalization: fold (per-channel train stats) "
                              "or subject (per-subject z-score)")
+    parser.add_argument("--aggregation", type=str, default="window",
+                        choices=["window", "subject"],
+                        help="Loss aggregation: window (BCE per window, "
+                             "correlated pseudo-samples) or subject "
+                             "(mean window logits -> one BCE per subject)")
+    parser.add_argument("--scheduler-patience", type=int, default=15,
+                        help="ReduceLROnPlateau patience (epochs of no "
+                             "improvement before halving LR)")
     parser.add_argument("--early-stop-on", type=str, default="window-bacc",
                         choices=["subject-bacc", "window-bacc"],
                         help="Validation signal for scheduler + best-epoch "
@@ -496,6 +539,8 @@ def main() -> None:
                 "refit_min_epochs": args.refit_min_epochs,
                 "loss": args.loss,
                 "norm": args.norm,
+                "aggregation": args.aggregation,
+                "scheduler_patience": args.scheduler_patience,
             },
             "model": {
                 "constructor": {
@@ -536,7 +581,9 @@ def main() -> None:
               f"batch={args.batch_size} lr={args.lr} wd={args.weight_decay} "
               f"dropout={args.dropout} label_smoothing={args.label_smoothing} "
               f"patience={args.patience} es={args.early_stop_on} "
-              f"bce_pw={not args.no_bce_pos_weight}")
+              f"bce_pw={not args.no_bce_pos_weight} "
+              f"aggregation={args.aggregation} "
+              f"sched_patience={args.scheduler_patience}")
         print(f" MODEL PARAMS         : total={total:,} trainable={trainable:,} frozen={frozen:,}")
         print("=" * 78)
 
@@ -585,6 +632,8 @@ def main() -> None:
                 mean, std, args.label_smoothing, args.loss, args.norm,
                 early_stop_on=args.early_stop_on,
                 bce_pos_weight=not args.no_bce_pos_weight,
+                aggregation=args.aggregation,
+                scheduler_patience=args.scheduler_patience,
             )
 
             if args.refit and best_epoch >= args.refit_min_epochs:
@@ -597,6 +646,7 @@ def main() -> None:
                     args.weight_decay, device, args.label_smoothing,
                     args.batch_size, args.loss, args.norm,
                     bce_pos_weight=not args.no_bce_pos_weight,
+                    aggregation=args.aggregation,
                 )
             train_subjects = (
                 (list(train_loader.dataset.names)
