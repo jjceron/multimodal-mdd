@@ -19,20 +19,23 @@ Design rationale (régimen: 53 subjects, ~33 train per fold):
      engineered representations, so the model can *auto-limit* the CNN if it
      finds no signal without losing the engineered one.
 
-  ``forward`` returns per-window logits ``[S*W, n_classes]`` (so the window
-  training loop provides ~10k samples); evaluation pools per subject via mean
-  softmax. ``forward_features`` returns the subject-level ``z_eeg [S, 2h]``
-  for the future cross-modal fusion.
+``forward`` returns per-window logits ``[S*W, n_classes]`` (so the window
+   training loop provides ~10k samples); evaluation pools per subject via mean
+   softmax. ``forward_features`` returns the subject-level ``z_eeg [S, 2h]``
+   for the future cross-modal fusion.
+
+   The engineered branch receives **pre-computed, per-fold scaled** features
+   ``x_eng [S, engine_dim]``. Scaling is a ``StandardScaler`` fit only on the
+   fold's train+val subjects (exactly as in the validated sklearn probe), so
+   the DL model consumes the *same* feature space that validated the signal
+   (AUC ~0.69) instead of re-normalizing per batch.
 """
 
 from __future__ import annotations
 
-import numpy as np
 import torch
 from torch import nn
 from torch.nn import functional as F
-
-from src.features.eeg_features import band_powers, global_features
 
 
 class SpectralConvNet(nn.Module):
@@ -75,8 +78,8 @@ class EEGBackbone(nn.Module):
     """Gated fusion of learned spectral CNN + validated engineered features.
 
     ``full_subject_input=True``: the training loop passes the whole subject
-    tensor ``[S, W, C, T]`` (raw ``x_raw``) so the engineered branch can be
-    computed on RAW windows; the model returns per-window logits.
+    tensor ``[S, W, C, T]`` (normalized) plus the pre-scaled subject-level
+    engineered features ``x_eng [S, 17]``; the model returns per-window logits.
     """
 
     def __init__(
@@ -91,7 +94,7 @@ class EEGBackbone(nn.Module):
     ) -> None:
         super().__init__()
         self.engineered_dim = engineered_dim
-        self.full_subject_input = True  # expects [S, W, C, T] + x_raw
+        self.full_subject_input = True  # expects [S, W, C, T] + x_eng [S, 17]
 
         self.cnn = SpectralConvNet(
             n_channels=n_channels, n_samples=n_samples,
@@ -99,7 +102,6 @@ class EEGBackbone(nn.Module):
         )
         self.cnn_norm = nn.LayerNorm(hidden)
 
-        self.eng_norm = nn.LayerNorm(engineered_dim)
         self.eng_proj = nn.Linear(engineered_dim, hidden)
 
         self.gate = nn.Linear(hidden * 2, hidden)
@@ -109,43 +111,31 @@ class EEGBackbone(nn.Module):
 
         self._z_eeg: torch.Tensor | None = None
 
-    def _window_z(self, x: torch.Tensor, x_raw: torch.Tensor | None = None) -> torch.Tensor:
-        """Per-window fused representation ``[S*W, 2h]``."""
+    def _window_z(self, x: torch.Tensor, x_eng: torch.Tensor | None = None) -> torch.Tensor:
+        """Per-window fused representation ``[S*W, 2h]``.
+
+        ``x_eng [S, engineered_dim]`` are pre-scaled (per-fold StandardScaler).
+        """
         S, W, C, T = x.shape
         flat = x.reshape(S * W, C, T)                 # [S*W, C, T] normalized
         z_cnn = self.cnn_norm(self.cnn(flat))          # [S*W, h]
 
-        raw = x_raw if x_raw is not None else x
-        eng_subj = self.eng_proj(self.eng_norm(_batch_engineered(raw).to(x.device)))
-        z_eng = eng_subj.repeat_interleave(W, dim=0)   # [S*W, h] (subject context)
+        z_eng = self.eng_proj(x_eng)                   # [S, h]
+        z_eng = z_eng.repeat_interleave(W, dim=0)      # [S*W, h] (subject context)
 
         g = torch.sigmoid(self.gate(torch.cat([z_cnn, z_eng], dim=-1)))  # [S*W, h]
         z = self.z_norm(torch.cat([g * z_cnn, (1 - g) * z_eng], dim=-1))
         return z
 
-    def forward(self, x: torch.Tensor, x_raw: torch.Tensor | None = None) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, x_eng: torch.Tensor | None = None) -> torch.Tensor:
         """Per-window logits ``[S*W, n_classes]``."""
-        z = self._window_z(x, x_raw)
+        z = self._window_z(x, x_eng)
         return self.head(self.drop(z))
 
-    def forward_features(self, x: torch.Tensor, x_raw: torch.Tensor | None = None) -> torch.Tensor:
+    def forward_features(self, x: torch.Tensor, x_eng: torch.Tensor | None = None) -> torch.Tensor:
         """Subject-level embedding ``z_eeg [S, 2h]`` (mean-pooled over windows)."""
-        z = self._window_z(x, x_raw)
+        z = self._window_z(x, x_eng)
         S, W = x.shape[0], x.shape[1]
         z_subj = z.view(S, W, -1).mean(dim=1)
         self._z_eeg = z_subj
         return z_subj
-
-
-def _batch_engineered(x: torch.Tensor) -> torch.Tensor:
-    """Compute the 17 engineered features for each subject in the batch.
-
-    x: ``[S, W, C, T]`` RAW windows. Returns ``[S, 17]`` torch float32.
-    """
-    feats = []
-    x = x.detach().cpu()
-    for s in range(x.shape[0]):
-        w = x[s].numpy()                                   # [W, C, T]
-        bp, mag2 = band_powers(w.astype(np.float32))
-        feats.append(global_features(bp, mag2))
-    return torch.as_tensor(np.stack(feats), dtype=torch.float32)

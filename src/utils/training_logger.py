@@ -13,6 +13,7 @@ class ClassificationLogger:
 
     def __init__(self):
         self.fold_metrics = []
+        self.fold_auc = []
 
     def metrics(self, true, pred):
         """Compute classification metrics dict."""
@@ -50,16 +51,22 @@ class ClassificationLogger:
             f"{vl_m['sens']:6.3f} {vl_m['spec']:6.3f} | {patience:2d}"
         )
 
-    def log_fold_test(self, test_true, test_pred):
+    def log_fold_test(self, test_true, test_pred, test_auc=None):
         m = self.metrics(test_true, test_pred)
         self.fold_metrics.append(m)
-        print(f"  >>> test: acc={m['acc']:.3f} bacc={m['bacc']:.3f} f1={m['f1']:.3f}")
+        self.fold_auc.append(test_auc)
+        auc_s = f"{test_auc:.3f}" if test_auc is not None else "  -  "
+        print(f"  >>> test: acc={m['acc']:.3f} bacc={m['bacc']:.3f} "
+              f"f1={m['f1']:.3f} auc={auc_s}")
         return m
 
     def log_summary(self, n_folds=None, split_type="gkf"):
         if n_folds is None:
             n_folds = len(self.fold_metrics)
         arrays = {k: np.array([m[k] for m in self.fold_metrics]) for k in _KEYS_CLAS}
+        aucs = np.array(
+            [a for a in self.fold_auc if a is not None], dtype=float
+        )
         title = "GKF" if split_type == "gkf" else "LOSO"
         print(f"\n{'=' * 60}")
         print(f"  {title} RESULT ({n_folds} folds)")
@@ -68,6 +75,11 @@ class ClassificationLogger:
         for k in _KEYS_CLAS:
             mn, sd = float(np.mean(arrays[k])), float(np.std(arrays[k]))
             print(f"  {k:>7s} | {mn:>8.3f} {'+-':>2s} {sd:>8.3f}")
+        if len(aucs):
+            print(
+                f"  {'auc':>7s} | {float(aucs.mean()):>8.3f} {'+-':>2s} "
+                f"{float(aucs.std()):>8.3f}"
+            )
         if n_folds > 1:
             print()
             hdr = " | ".join(f"{k:>8s}" for k in _KEYS_CLAS)

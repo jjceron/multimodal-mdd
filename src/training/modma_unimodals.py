@@ -19,11 +19,14 @@ import numpy as np
 import sklearn
 import torch
 from sklearn.metrics import roc_auc_score
+from sklearn.preprocessing import StandardScaler
 from torch.utils.data import DataLoader, Dataset
 
+from src.features.eeg_features import subject_features
 from src.models.deepconvnet import DeepConvNet
 from src.models.eeg_backbone import EEGBackbone
 from src.preprocessing.modma_eeg import MODMADataset, create_dataloaders
+from src.training.subject_classification import run_subject_cv
 from src.utils.get_seed import set_seed
 from src.utils.training_logger import ClassificationLogger
 
@@ -38,9 +41,9 @@ MODEL_CLASSES = {
 
 
 def forward_logits(model: torch.nn.Module, x: torch.Tensor,
-                   x_raw: torch.Tensor | None = None) -> torch.Tensor:
+                   x_eng: torch.Tensor | None = None) -> torch.Tensor:
     """Forward pass returning only the class logits tensor."""
-    out = model(x, x_raw=x_raw) if getattr(model, "full_subject_input", False) else model(x)
+    out = model(x, x_eng=x_eng) if getattr(model, "full_subject_input", False) else model(x)
     if isinstance(out, tuple):
         out = out[0]
     return out
@@ -82,6 +85,30 @@ def preprocess_subject(x: torch.Tensor, mean: torch.Tensor,
     """Per-channel z-score keeping the ``[S, W, C, T]`` subject layout."""
     shape = [1, 1, -1] + [1] * (x.dim() - 3)
     return (x - mean.view(shape)) / (std.view(shape) + 1e-8)
+
+
+def build_eng_feats(ds) -> dict[str, np.ndarray]:
+    """per-subject 17-dim engineered features: {participant_id: row}."""
+    _, _, X = subject_features(ds)
+    subjects = [s["participant_id"] for s in ds.samples]
+    return {s: X[i] for i, s in enumerate(subjects)}
+
+
+def fit_eng_scaler(eng_feats: dict[str, np.ndarray],
+                   train_names, val_names) -> dict[str, np.ndarray]:
+    """Fit StandardScaler on train+val subjects only -> scaled {id: row}.
+
+    Leak-free: the scaler never sees test subjects (same contract as the probe).
+    """
+    rows = np.stack([eng_feats[n] for n in (list(train_names) + list(val_names))])
+    scaler = StandardScaler().fit(rows)
+    return {n: scaler.transform(eng_feats[n].reshape(1, -1))[0] for n in eng_feats}
+
+
+def batch_x_eng(names, eng_by_name: dict[str, np.ndarray], device: str) -> torch.Tensor:
+    """Scaled per-subject engineered rows for a batch: ``[B, 17]`` on device."""
+    rows = np.stack([eng_by_name[n] for n in names])
+    return torch.as_tensor(rows, dtype=torch.float32).to(device)
 
 
 def make_criterion(loss: str, device: str, label_smoothing: float, *,
@@ -127,15 +154,16 @@ def subject_prob(logits: torch.Tensor, n_subjects: int, windows: int) -> torch.T
 
 
 def forward_batch(model: torch.nn.Module, x: torch.Tensor, y: torch.Tensor,
-                  mean: torch.Tensor, std: torch.Tensor, device: str):
+                  mean: torch.Tensor, std: torch.Tensor, device: str,
+                  names=None, eng_by_name: dict[str, np.ndarray] | None = None):
     """Model-agnostic forward.
 
     Window-level models receive flattened ``[S*W, C, T]`` (labels expanded per
     window). Subject-level models (``subject_level``) receive the full
     ``[S, W, C, T]`` and return one logit row per subject directly.
     ``full_subject_input`` models get the full normalized subject tensor and
-    the RAW subject tensor (for an engineered branch), returning per-window
-    logits.
+    the pre-scaled engineered features ``x_eng [S, 17]`` (per-fold
+    StandardScaler), returning per-window logits.
 
     Returns ``(logits, labels)`` both on ``device``.
     """
@@ -144,7 +172,11 @@ def forward_batch(model: torch.nn.Module, x: torch.Tensor, y: torch.Tensor,
         return model(xn.to(device)), y.to(device)
     if getattr(model, "full_subject_input", False):
         xn = preprocess_subject(x, mean, std)
-        logits = model(xn.to(device), x_raw=x.to(device))
+        x_eng = (
+            batch_x_eng(list(names), eng_by_name, device)
+            if eng_by_name is not None else None
+        )
+        logits = model(xn.to(device), x_eng=x_eng)
         labels = expand_labels(y, x.shape[1]).to(device)
         return logits, labels
     flat, windows = preprocess(x, mean, std)
@@ -201,6 +233,7 @@ def train_fold(
     loss: str,
     early_stop_on: str = "window-bacc",
     bce_pos_weight: bool = True,
+    eng_by_name: dict[str, np.ndarray] | None = None,
 ) -> tuple[dict, int]:
     optimizer = torch.optim.AdamW(
         model.parameters(), lr=lr, weight_decay=weight_decay
@@ -233,8 +266,9 @@ def train_fold(
     for epoch in range(1, epochs + 1):
         model.train()
         tr_loss, tr_correct, tr_total = 0.0, 0, 0
-        for _, x, y in train_loader:
-            logits, yf = forward_batch(model, x, y, mean, std, device)
+        for name, x, y in train_loader:
+            logits, yf = forward_batch(model, x, y, mean, std, device,
+                                       names=name, eng_by_name=eng_by_name)
             optimizer.zero_grad()
             tloss = step_loss(criterion, logits, yf, loss)
             tloss.backward()
@@ -247,8 +281,9 @@ def train_fold(
         val_loss, val_true, val_pred = 0.0, [], []
         val_subj_true, val_subj_pred = [], []
         with torch.no_grad():
-            for _, x, y in val_loader:
-                logits, yf = forward_batch(model, x, y, mean, std, device)
+            for name, x, y in val_loader:
+                logits, yf = forward_batch(model, x, y, mean, std, device,
+                                           names=name, eng_by_name=eng_by_name)
                 val_loss += step_loss(criterion, logits, yf, loss).item() * len(yf)
                 if getattr(model, "subject_level", False):
                     val_true.extend(y.tolist())
@@ -332,6 +367,7 @@ def refit_model(
     batch_size: int,
     loss: str,
     bce_pos_weight: bool = True,
+    eng_by_name: dict[str, np.ndarray] | None = None,
 ) -> tuple[torch.nn.Module, torch.Tensor, torch.Tensor]:
     """Retrain ``model`` on train+val for exactly ``epochs`` epochs (no early stop)."""
     x = torch.cat([train_loader.dataset.X, val_loader.dataset.X])
@@ -359,8 +395,9 @@ def refit_model(
 
     model.train()
     for _ in range(epochs):
-        for _, xb, yb in loader:
-            logits, yf = forward_batch(model, xb, yb, mean, std, device)
+        for name, xb, yb in loader:
+            logits, yf = forward_batch(model, xb, yb, mean, std, device,
+                                       names=name, eng_by_name=eng_by_name)
             optimizer.zero_grad()
             tloss = step_loss(criterion, logits, yf, loss)
             tloss.backward()
@@ -369,21 +406,24 @@ def refit_model(
 
 
 def run_fold_test(model: torch.nn.Module, test_loader, device: str,
-                  mean: torch.Tensor, std: torch.Tensor) -> dict:
+                  mean: torch.Tensor, std: torch.Tensor,
+                  eng_by_name: dict[str, np.ndarray] | None = None) -> dict:
     true_subj, pred_subj, prob_subj = [], [], []
     true_win, pred_win = [], []
 
     model.eval()
     with torch.no_grad():
-        for _, x, y in test_loader:
+        for name, x, y in test_loader:
             if getattr(model, "subject_level", False):
-                logits, _ = forward_batch(model, x, y, mean, std, device)
+                logits, _ = forward_batch(model, x, y, mean, std, device,
+                                          names=name, eng_by_name=eng_by_name)
                 prob = logits.softmax(dim=1)[:, 1].cpu()
                 true_subj.extend(y.numpy().tolist())
                 pred_subj.extend((prob >= 0.5).long().numpy().tolist())
                 prob_subj.extend(prob.numpy().tolist())
             elif getattr(model, "full_subject_input", False):
-                logits, _ = forward_batch(model, x, y, mean, std, device)
+                logits, _ = forward_batch(model, x, y, mean, std, device,
+                                          names=name, eng_by_name=eng_by_name)
                 windows = x.shape[1]
                 logits = logits.cpu()
                 yf = expand_labels(y, windows)
@@ -488,6 +528,8 @@ def main() -> None:
     # window shape: [W, C, T]
     n_samples = ds.samples[0]["eeg"].shape[-1]
 
+    eng_feats = build_eng_feats(ds)  # deterministic per-subject 17-dim
+
     windows = int(ds.samples[0]["eeg"].shape[0])
     model_hdr = build_model(
         args.model, n_channels, n_classes=2, n_samples=n_samples,
@@ -498,6 +540,16 @@ def main() -> None:
 
     for split_seed in args.split_seed:
         print(f"\n{'=' * 78}\n  SPLIT SEED            : {split_seed}\n{'=' * 78}")
+
+        probe = run_subject_cv(
+            ds, k=args.k, inner_k=args.inner_splits, split_seed=split_seed
+        )
+        ps = probe["summary"]
+        print(
+            "  probe baseline      : BACC "
+            f"{ps['bacc_mean']:.3f}+/-{ps['bacc_std']:.3f}  "
+            f"AUC {ps['auc_mean'] if ps['auc_mean'] is None else round(ps['auc_mean'], 3)}"
+        )
 
         folds = create_dataloaders(
             ds,
@@ -611,6 +663,7 @@ def main() -> None:
             config=config,
             results_folds=results_folds,
             out_dir=out_dir,
+            probe=probe,
         ) -> None:
             results = {
                 "modal": args.modal,
@@ -622,6 +675,7 @@ def main() -> None:
                 "n_channels": n_channels,
                 "n_samples": n_samples,
                 "config": config,
+                "baseline_probe": probe["summary"],
                 "folds": results_folds,
             }
             with open(out_dir / "results.json", "w") as f:
@@ -637,6 +691,9 @@ def main() -> None:
                   f"HC/MDD={cls_counts(val_loader)} | test={len(test_loader.dataset)} "
                   f"HC/MDD={cls_counts(test_loader)}")
             mean, std = channel_stats(train_loader)
+            eng_by_name = fit_eng_scaler(
+                eng_feats, train_loader.dataset.names, val_loader.dataset.names
+            )
             model = build_model(
                 args.model, n_channels, n_classes=2, n_samples=n_samples,
                 dropout=args.dropout, hidden=args.hidden, n_filters=args.n_filters,
@@ -648,6 +705,7 @@ def main() -> None:
                 mean, std, args.label_smoothing, args.loss,
                 early_stop_on=args.early_stop_on,
                 bce_pos_weight=not args.no_bce_pos_weight,
+                eng_by_name=eng_by_name,
             )
 
             if args.refit:
@@ -660,6 +718,7 @@ def main() -> None:
                     args.weight_decay, device, args.label_smoothing,
                     args.batch_size, args.loss,
                     bce_pos_weight=not args.no_bce_pos_weight,
+                    eng_by_name=eng_by_name,
                 )
             train_subjects = (
                 (list(train_loader.dataset.names)
@@ -667,7 +726,8 @@ def main() -> None:
                 if args.refit else list(train_loader.dataset.names)
             )
 
-            fold_res = run_fold_test(model, test_loader, device, mean, std)
+            fold_res = run_fold_test(model, test_loader, device, mean, std,
+                                     eng_by_name=eng_by_name)
             fold_res["fold"] = fold_idx
             fold_res["history"] = history
             fold_res["best_epoch"] = best_epoch
@@ -675,7 +735,8 @@ def main() -> None:
             fold_res["val_subjects"] = list(val_loader.dataset.names)
             fold_res["test_subjects"] = list(test_loader.dataset.names)
             fold_res["test_metrics"] = logger.log_fold_test(
-                fold_res["test_true"], fold_res["test_pred"]
+                fold_res["test_true"], fold_res["test_pred"],
+                test_auc=fold_res["test_auc"],
             )
             results_folds.append(fold_res)
 
