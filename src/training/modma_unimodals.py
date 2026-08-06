@@ -37,9 +37,10 @@ MODEL_CLASSES = {
 }
 
 
-def forward_logits(model: torch.nn.Module, x: torch.Tensor) -> torch.Tensor:
+def forward_logits(model: torch.nn.Module, x: torch.Tensor,
+                   x_raw: torch.Tensor | None = None) -> torch.Tensor:
     """Forward pass returning only the class logits tensor."""
-    out = model(x)
+    out = model(x, x_raw=x_raw) if getattr(model, "full_subject_input", False) else model(x)
     if isinstance(out, tuple):
         out = out[0]
     return out
@@ -129,15 +130,23 @@ def forward_batch(model: torch.nn.Module, x: torch.Tensor, y: torch.Tensor,
                   mean: torch.Tensor, std: torch.Tensor, device: str):
     """Model-agnostic forward.
 
-    Window-level models receive ``[S*W, C, T]`` and their subject labels are
-    expanded per window. Subject-level models (``subject_level``) receive the
-    full ``[S, W, C, T]`` and return one logit row per subject directly.
+    Window-level models receive flattened ``[S*W, C, T]`` (labels expanded per
+    window). Subject-level models (``subject_level``) receive the full
+    ``[S, W, C, T]`` and return one logit row per subject directly.
+    ``full_subject_input`` models get the full normalized subject tensor and
+    the RAW subject tensor (for an engineered branch), returning per-window
+    logits.
 
     Returns ``(logits, labels)`` both on ``device``.
     """
     if getattr(model, "subject_level", False):
         xn = preprocess_subject(x, mean, std)
         return model(xn.to(device)), y.to(device)
+    if getattr(model, "full_subject_input", False):
+        xn = preprocess_subject(x, mean, std)
+        logits = model(xn.to(device), x_raw=x.to(device))
+        labels = expand_labels(y, x.shape[1]).to(device)
+        return logits, labels
     flat, windows = preprocess(x, mean, std)
     labels = expand_labels(y, windows).to(device)
     return model(flat.to(device)), labels
@@ -150,6 +159,7 @@ def build_model(
     n_samples: int,
     dropout: float,
     hidden: int = 32,
+    n_filters: int = 16,
 ) -> torch.nn.Module:
     cls = MODEL_CLASSES[name]
     return cls(
@@ -157,7 +167,7 @@ def build_model(
         n_classes=n_classes,
         n_samples=n_samples,
         dropout=dropout,
-        **({"hidden": hidden} if name == "eeg_backbone" else {}),
+        **({"hidden": hidden, "n_filters": n_filters} if name == "eeg_backbone" else {}),
     )
 
 
@@ -372,6 +382,17 @@ def run_fold_test(model: torch.nn.Module, test_loader, device: str,
                 true_subj.extend(y.numpy().tolist())
                 pred_subj.extend((prob >= 0.5).long().numpy().tolist())
                 prob_subj.extend(prob.numpy().tolist())
+            elif getattr(model, "full_subject_input", False):
+                logits, _ = forward_batch(model, x, y, mean, std, device)
+                windows = x.shape[1]
+                logits = logits.cpu()
+                yf = expand_labels(y, windows)
+                true_win.extend(yf.tolist())
+                pred_win.extend(logits.argmax(1).tolist())
+                prob = subject_prob(logits, x.shape[0], windows)
+                true_subj.extend(y.numpy().tolist())
+                pred_subj.extend((prob >= 0.5).long().numpy().tolist())
+                prob_subj.extend(prob.numpy().tolist())
             else:
                 flat, windows = preprocess(x, mean, std)
                 logits = forward_logits(model, flat.to(device)).cpu()
@@ -412,6 +433,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--notch", type=float, default=50.0)
     parser.add_argument("--model", type=str, default="deepconvnet",
                         choices=sorted(MODEL_CLASSES))
+    parser.add_argument("--hidden", type=int, default=32,
+                        help="Hidden dim for the eeg_backbone fusion head")
+    parser.add_argument("--n-filters", type=int, default=16,
+                        help="Spectral filter count for the eeg_backbone CNN")
     parser.add_argument("--loss", type=str, default="bce",
                         choices=["ce", "bce"],
                         help="Loss: bce (BCE + label smoothing) or ce (weighted CE)")
@@ -466,7 +491,7 @@ def main() -> None:
     windows = int(ds.samples[0]["eeg"].shape[0])
     model_hdr = build_model(
         args.model, n_channels, n_classes=2, n_samples=n_samples,
-        dropout=args.dropout,
+        dropout=args.dropout, hidden=args.hidden, n_filters=args.n_filters,
     )
     total, trainable, frozen = count_parameters(model_hdr)
     gpu = torch.cuda.get_device_name(0) if torch.cuda.is_available() else "CPU"
@@ -614,7 +639,7 @@ def main() -> None:
             mean, std = channel_stats(train_loader)
             model = build_model(
                 args.model, n_channels, n_classes=2, n_samples=n_samples,
-                dropout=args.dropout,
+                dropout=args.dropout, hidden=args.hidden, n_filters=args.n_filters,
             ).to(device)
 
             history, best_epoch = train_fold(
@@ -629,7 +654,7 @@ def main() -> None:
                 model, mean, std = refit_model(
                     build_model(
                         args.model, n_channels, n_classes=2, n_samples=n_samples,
-                        dropout=args.dropout,
+                        dropout=args.dropout, hidden=args.hidden, n_filters=args.n_filters,
                     ).to(device),
                     train_loader, val_loader, args.refit_epochs, args.lr,
                     args.weight_decay, device, args.label_smoothing,
