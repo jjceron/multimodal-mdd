@@ -36,58 +36,15 @@ from sklearn.metrics import balanced_accuracy_score, roc_auc_score
 from sklearn.model_selection import StratifiedGroupKFold
 from sklearn.preprocessing import StandardScaler
 
+from src.features.eeg_features import (
+    subject_features,
+)
 from src.preprocessing.modma_eeg import MODMADataset
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_OUTPUT_ROOT = PROJECT_ROOT / "outputs/results/unimodals/eeg"
 
-FS = 250.0
-EPS = 1e-12
-BANDS = {
-    "delta": (0.4, 4.0),
-    "theta": (4.0, 8.0),
-    "alpha": (8.0, 13.0),
-    "beta": (13.0, 30.0),
-    "gamma": (30.0, 45.0),
-}
 # no L2 regularisation grid: fixed C=1.0 validated in the subject-level probe
-
-
-def band_powers(windows: np.ndarray) -> dict[str, np.ndarray]:
-    """windows [W, C, T] -> {band: [W, C] band power}."""
-    mag2 = np.abs(np.fft.rfft(windows, axis=-1)) ** 2
-    freqs = np.fft.rfftfreq(windows.shape[-1], d=1.0 / FS)
-    out: dict[str, np.ndarray] = {}
-    for name, (f0, f1) in BANDS.items():
-        mask = (freqs >= f0) & (freqs < f1)
-        out[name] = mag2[:, :, mask].sum(axis=-1)
-    return out, mag2
-
-
-def global_features(bp: dict[str, np.ndarray], mag2: np.ndarray) -> np.ndarray:
-    """Subject-level statistics over windows: [d] vector."""
-    feats = []
-    for name in BANDS:
-        mean_acw = bp[name].mean(axis=0)  # [C] mean over windows
-        std_acw = bp[name].std(axis=0)    # [C] std over windows (dynamics)
-        feats += [mean_acw.mean(), mean_acw.std(), std_acw.mean()]
-    p = mag2 / (mag2.sum(axis=-1, keepdims=True) + EPS)
-    ent = -np.sum(p * np.log(p + EPS), axis=-1)  # [W, C]
-    ent_mean_c = ent.mean(axis=0)                # [C]
-    feats += [ent_mean_c.mean(), ent_mean_c.std()]
-    return np.asarray(feats)
-
-
-def subject_features(ds: MODMADataset) -> tuple[list[str], np.ndarray, np.ndarray]:
-    """Per-subject static features: (subjects, y, X [N, d])."""
-    subjects, labels, feats = [], [], []
-    for s in ds.samples:
-        w = s["eeg"].numpy()
-        bp, mag2 = band_powers(w)
-        feats.append(global_features(bp, mag2))
-        subjects.append(s["participant_id"])
-        labels.append(int(s["label"].item()))
-    return subjects, np.asarray(labels), np.asarray(feats)
 
 
 def make_splits(subjects, y, X, k, inner_k, split_seed):

@@ -22,6 +22,7 @@ from sklearn.metrics import roc_auc_score
 from torch.utils.data import DataLoader, Dataset
 
 from src.models.deepconvnet import DeepConvNet
+from src.models.eeg_backbone import EEGBackbone
 from src.preprocessing.modma_eeg import MODMADataset, create_dataloaders
 from src.utils.get_seed import set_seed
 from src.utils.training_logger import ClassificationLogger
@@ -32,6 +33,7 @@ NUM_WORKERS = 4 if platform.system() != "Windows" else 0
 
 MODEL_CLASSES = {
     "deepconvnet": DeepConvNet,
+    "eeg_backbone": EEGBackbone,
 }
 
 
@@ -72,6 +74,13 @@ def preprocess(x: torch.Tensor, mean: torch.Tensor, std: torch.Tensor) -> tuple[
     """Per-channel z-score with fold-level train stats, then flatten windows."""
     flat, windows = flatten_batch(x)
     return normalize_channels(flat, mean, std), windows
+
+
+def preprocess_subject(x: torch.Tensor, mean: torch.Tensor,
+                       std: torch.Tensor) -> torch.Tensor:
+    """Per-channel z-score keeping the ``[S, W, C, T]`` subject layout."""
+    shape = [1, 1, -1] + [1] * (x.dim() - 3)
+    return (x - mean.view(shape)) / (std.view(shape) + 1e-8)
 
 
 def make_criterion(loss: str, device: str, label_smoothing: float, *,
@@ -116,12 +125,31 @@ def subject_prob(logits: torch.Tensor, n_subjects: int, windows: int) -> torch.T
     return logits_subj.softmax(dim=2)[:, :, 1].mean(dim=1)
 
 
+def forward_batch(model: torch.nn.Module, x: torch.Tensor, y: torch.Tensor,
+                  mean: torch.Tensor, std: torch.Tensor, device: str):
+    """Model-agnostic forward.
+
+    Window-level models receive ``[S*W, C, T]`` and their subject labels are
+    expanded per window. Subject-level models (``subject_level``) receive the
+    full ``[S, W, C, T]`` and return one logit row per subject directly.
+
+    Returns ``(logits, labels)`` both on ``device``.
+    """
+    if getattr(model, "subject_level", False):
+        xn = preprocess_subject(x, mean, std)
+        return model(xn.to(device)), y.to(device)
+    flat, windows = preprocess(x, mean, std)
+    labels = expand_labels(y, windows).to(device)
+    return model(flat.to(device)), labels
+
+
 def build_model(
     name: str,
     n_channels: int,
     n_classes: int,
     n_samples: int,
     dropout: float,
+    hidden: int = 32,
 ) -> torch.nn.Module:
     cls = MODEL_CLASSES[name]
     return cls(
@@ -129,6 +157,7 @@ def build_model(
         n_classes=n_classes,
         n_samples=n_samples,
         dropout=dropout,
+        **({"hidden": hidden} if name == "eeg_backbone" else {}),
     )
 
 
@@ -195,10 +224,8 @@ def train_fold(
         model.train()
         tr_loss, tr_correct, tr_total = 0.0, 0, 0
         for _, x, y in train_loader:
-            flat, windows = preprocess(x, mean, std)
-            yf = expand_labels(y, windows).to(device)
+            logits, yf = forward_batch(model, x, y, mean, std, device)
             optimizer.zero_grad()
-            logits = forward_logits(model, flat.to(device))
             tloss = step_loss(criterion, logits, yf, loss)
             tloss.backward()
             optimizer.step()
@@ -211,16 +238,22 @@ def train_fold(
         val_subj_true, val_subj_pred = [], []
         with torch.no_grad():
             for _, x, y in val_loader:
-                flat, windows = preprocess(x, mean, std)
-                yf = expand_labels(y, windows)
-                logits = forward_logits(model, flat.to(device))
-                val_loss += step_loss(criterion, logits, yf.to(device),
-                                      loss).item() * len(yf)
-                val_true.extend(yf.tolist())
-                val_pred.extend(logits.argmax(1).cpu().tolist())
-                subj_prob = subject_prob(logits, x.shape[0], windows)
-                val_subj_true.extend(y.cpu().tolist())
-                val_subj_pred.extend((subj_prob >= 0.5).long().cpu().tolist())
+                logits, yf = forward_batch(model, x, y, mean, std, device)
+                val_loss += step_loss(criterion, logits, yf, loss).item() * len(yf)
+                if getattr(model, "subject_level", False):
+                    val_true.extend(y.tolist())
+                    val_pred.extend(logits.argmax(1).cpu().tolist())
+                    val_subj_true.extend(y.tolist())
+                    prob = logits.softmax(dim=1)[:, 1].cpu()
+                    val_subj_pred.extend((prob >= 0.5).long().tolist())
+                else:
+                    yf_cpu = yf
+                    windows = x.shape[1]
+                    val_true.extend(yf_cpu.tolist())
+                    val_pred.extend(logits.argmax(1).cpu().tolist())
+                    subj_prob = subject_prob(logits, x.shape[0], windows)
+                    val_subj_true.extend(y.cpu().tolist())
+                    val_subj_pred.extend((subj_prob >= 0.5).long().cpu().tolist())
 
         tr_acc = tr_correct / max(tr_total, 1)
         tr_loss /= max(tr_total, 1)
@@ -317,10 +350,8 @@ def refit_model(
     model.train()
     for _ in range(epochs):
         for _, xb, yb in loader:
-            flat, windows = preprocess(xb, mean, std)
-            yf = expand_labels(yb, windows).to(device)
+            logits, yf = forward_batch(model, xb, yb, mean, std, device)
             optimizer.zero_grad()
-            logits = forward_logits(model, flat.to(device))
             tloss = step_loss(criterion, logits, yf, loss)
             tloss.backward()
             optimizer.step()
@@ -335,16 +366,23 @@ def run_fold_test(model: torch.nn.Module, test_loader, device: str,
     model.eval()
     with torch.no_grad():
         for _, x, y in test_loader:
-            flat, windows = preprocess(x, mean, std)
-            logits = forward_logits(model, flat.to(device)).cpu()
-            yf = expand_labels(y, windows)
-            true_win.extend(yf.tolist())
-            pred_win.extend(logits.argmax(1).tolist())
+            if getattr(model, "subject_level", False):
+                logits, _ = forward_batch(model, x, y, mean, std, device)
+                prob = logits.softmax(dim=1)[:, 1].cpu()
+                true_subj.extend(y.numpy().tolist())
+                pred_subj.extend((prob >= 0.5).long().numpy().tolist())
+                prob_subj.extend(prob.numpy().tolist())
+            else:
+                flat, windows = preprocess(x, mean, std)
+                logits = forward_logits(model, flat.to(device)).cpu()
+                yf = expand_labels(y, windows)
+                true_win.extend(yf.tolist())
+                pred_win.extend(logits.argmax(1).tolist())
 
-            prob = subject_prob(logits, x.shape[0], windows)
-            true_subj.extend(y.numpy().tolist())
-            pred_subj.extend((prob >= 0.5).long().numpy().tolist())
-            prob_subj.extend(prob.numpy().tolist())
+                prob = subject_prob(logits, x.shape[0], windows)
+                true_subj.extend(y.numpy().tolist())
+                pred_subj.extend((prob >= 0.5).long().numpy().tolist())
+                prob_subj.extend(prob.numpy().tolist())
 
     true, pred = np.asarray(true_subj), np.asarray(pred_subj)
     auc = float(roc_auc_score(true, prob_subj)) if len(set(true.tolist())) > 1 else None
