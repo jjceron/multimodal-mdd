@@ -12,6 +12,7 @@ import argparse
 import json
 import platform
 from collections import Counter
+from collections.abc import Callable
 from pathlib import Path
 
 import mne
@@ -234,6 +235,7 @@ def train_fold(
     early_stop_on: str = "window-bacc",
     bce_pos_weight: bool = True,
     eng_by_name: dict[str, np.ndarray] | None = None,
+    epoch_cb: Callable[[int, dict], None] | None = None,
 ) -> tuple[dict, int]:
     optimizer = torch.optim.AdamW(
         model.parameters(), lr=lr, weight_decay=weight_decay
@@ -333,6 +335,17 @@ def train_fold(
         logger.log_epoch(
             epoch, tr_loss, val_loss, {"acc": tr_acc}, vl_m, patience_left
         )
+
+        if epoch_cb is not None:
+            epoch_cb(epoch, {
+                "fold": getattr(epoch_cb, "_fold", 1),
+                "epoch": epoch,
+                "tr_loss": tr_loss, "va_loss": val_loss,
+                "tr_acc": tr_acc, "va_acc": vl_m["acc"],
+                "va_bacc": vl_m["bacc"], "va_f1": vl_m["f1"],
+                "va_sens": vl_m["sens"], "va_spec": vl_m["spec"],
+                "pat": patience_left,
+            })
 
         if patience_left >= patience:
             break
@@ -462,6 +475,12 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Unimodal MODMA EEG classification")
     parser.add_argument("--modal", type=str, default="eeg",
                         choices=["eeg"])
+    parser.add_argument("--representation", type=str, default="time",
+                        choices=["time"],
+                        help="Input representation (accepted/validated; time only)")
+    parser.add_argument("--norm", type=str, default="fold",
+                        choices=["fold"],
+                        help="Normalization scheme (accepted/validated; fold only)")
     parser.add_argument("--channels", type=str, default="29",
                         choices=["all", "10-20", "f64", "29"])
     parser.add_argument("--overlap", type=float, default=0.5)
@@ -541,6 +560,13 @@ def main() -> None:
     for split_seed in args.split_seed:
         print(f"\n{'=' * 78}\n  SPLIT SEED            : {split_seed}\n{'=' * 78}")
 
+        json_path = Path("logs") / f"unimodals_{args.tag}.json"
+        json_path.parent.mkdir(parents=True, exist_ok=True)
+        log_json = open(json_path, "a", encoding="utf-8")  # noqa: SIM115 - append session for live monitor
+        def write_json(obj, _f=log_json):
+            _f.write(json.dumps(obj, separators=(",", ":")) + "\n")
+            _f.flush()
+
         probe = run_subject_cv(
             ds, k=args.k, inner_k=args.inner_splits, split_seed=split_seed
         )
@@ -550,6 +576,11 @@ def main() -> None:
             f"{ps['bacc_mean']:.3f}+/-{ps['bacc_std']:.3f}  "
             f"AUC {ps['auc_mean'] if ps['auc_mean'] is None else round(ps['auc_mean'], 3)}"
         )
+        write_json({"kind": "probe", "split_seed": split_seed, "summary": ps})
+
+        def epoch_cb(epoch, m):
+            _ = epoch
+            write_json({"kind": "epoch", **m})
 
         folds = create_dataloaders(
             ds,
@@ -694,6 +725,7 @@ def main() -> None:
             eng_by_name = fit_eng_scaler(
                 eng_feats, train_loader.dataset.names, val_loader.dataset.names
             )
+            epoch_cb._fold = fold_idx
             model = build_model(
                 args.model, n_channels, n_classes=2, n_samples=n_samples,
                 dropout=args.dropout, hidden=args.hidden, n_filters=args.n_filters,
@@ -705,7 +737,7 @@ def main() -> None:
                 mean, std, args.label_smoothing, args.loss,
                 early_stop_on=args.early_stop_on,
                 bce_pos_weight=not args.no_bce_pos_weight,
-                eng_by_name=eng_by_name,
+                eng_by_name=eng_by_name, epoch_cb=epoch_cb,
             )
 
             if args.refit:
@@ -740,6 +772,16 @@ def main() -> None:
             )
             results_folds.append(fold_res)
 
+            write_json({
+                "kind": "test",
+                "fold": fold_idx,
+                "best_epoch": best_epoch,
+                "acc": fold_res["test_metrics"]["acc"],
+                "bacc": fold_res["test_metrics"]["bacc"],
+                "f1": fold_res["test_metrics"]["f1"],
+                "auc": fold_res["test_auc"],
+            })
+
             if args.save_model:
                 torch.save(
                     model.state_dict(), out_dir / f"fold_{fold_idx}.pt"
@@ -751,6 +793,14 @@ def main() -> None:
 
         logger.log_summary(n_folds=args.k, split_type="gkf")
         print(f"\nFinal results: {out_dir / 'results.json'}")
+        write_json({
+            "kind": "summary",
+            "split_seed": split_seed,
+            "tag": args.tag,
+            "model": args.model,
+            "probe": ps,
+        })
+        log_json.close()
 
 
 if __name__ == "__main__":
