@@ -54,7 +54,10 @@ class EEGBackbone(nn.Module):
         )
 
         self.cnn_proj = nn.Linear(self.encoder.fc_features, hidden)
+        self.eng_norm = nn.LayerNorm(engineered_dim)
         self.eng_proj = nn.Linear(engineered_dim, hidden)
+        self.cnn_norm = nn.LayerNorm(hidden)
+        self.z_norm = nn.LayerNorm(hidden * 2)
         self.head = nn.Linear(hidden * 2, n_classes)
         self.drop = nn.Dropout(dropout) if dropout > 0 else nn.Identity()
 
@@ -70,10 +73,10 @@ class EEGBackbone(nn.Module):
         flat = x.reshape(S * W, C, T)                     # [S*W, C, T]
         emb = self.encoder.forward_features(flat)          # [S*W, fc]
         z_cnn = emb.view(S, W, -1).mean(dim=1)             # [S, fc] mean-pool
-        z_cnn = self.drop(nn.functional.gelu(self.cnn_proj(z_cnn)))  # [S, h]
+        z_cnn = self.cnn_norm(self.drop(nn.functional.gelu(self.cnn_proj(z_cnn))))
 
-        z_eng = self.eng_proj(_batch_engineered(x).to(x.device))  # [S, h]
-        z = torch.cat([z_cnn, z_eng], dim=-1)              # [S, 2h]
+        z_eng = self.eng_proj(self.eng_norm(_batch_engineered(x).to(x.device)))
+        z = self.z_norm(torch.cat([z_cnn, z_eng], dim=-1))  # [S, 2h]
         self._z_eeg = z
         return z
 
