@@ -443,10 +443,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--tag", type=str, default="base")
     parser.add_argument("--epochs", type=int, default=300)
     parser.add_argument("--batch-size", type=int, default=32)
-    parser.add_argument("--lr", type=float, default=5e-4)
+    parser.add_argument("--lr", type=float, default=2e-3)
     parser.add_argument("--weight-decay", type=float, default=5e-3)
     parser.add_argument("--patience", type=int, default=40)
-    parser.add_argument("--dropout", type=float, default=0.5)
+    parser.add_argument("--dropout", type=float, default=0.4)
     parser.add_argument("--label-smoothing", type=float, default=0.05)
     parser.add_argument("--refit", action="store_true",
                         help="Retrain final model on train+val before testing")
