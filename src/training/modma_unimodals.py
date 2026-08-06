@@ -123,15 +123,10 @@ def expand_labels(y: torch.Tensor, windows: int) -> torch.Tensor:
     return y.view(-1, 1).repeat(1, windows).reshape(-1)
 
 
-def subject_logits(logits: torch.Tensor, n_subjects: int,
-                   windows: int) -> torch.Tensor:
-    """Aggregate window logits to one logit vector per subject (mean in logit space)."""
-    return logits.view(n_subjects, windows, -1).mean(dim=1)
-
-
 def subject_prob(logits: torch.Tensor, n_subjects: int, windows: int) -> torch.Tensor:
-    """Per-subject class-1 probability via mean(logits) then softmax."""
-    return subject_logits(logits, n_subjects, windows).softmax(dim=1)[:, 1]
+    """Per-subject class-1 probability: softmax per window, then mean over windows."""
+    logits_subj = logits.view(n_subjects, windows, -1)
+    return logits_subj.softmax(dim=2)[:, :, 1].mean(dim=1)
 
 
 def build_model(
@@ -179,14 +174,12 @@ def train_fold(
     norm: str,
     early_stop_on: str = "window-bacc",
     bce_pos_weight: bool = True,
-    aggregation: str = "window",
-    scheduler_patience: int = 15,
 ) -> tuple[dict, int]:
     optimizer = torch.optim.AdamW(
         model.parameters(), lr=lr, weight_decay=weight_decay
     )
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
-        optimizer, mode="max", factor=0.5, patience=scheduler_patience
+        optimizer, mode="max", factor=0.5, patience=15
     )
     criterion = make_criterion(
         loss, device, label_smoothing, train_loader=train_loader,
@@ -215,29 +208,15 @@ def train_fold(
         tr_loss, tr_correct, tr_total = 0.0, 0, 0
         for _, x, y in train_loader:
             flat, windows = preprocess(x, mean, std, norm)
+            yf = expand_labels(y, windows).to(device)
             optimizer.zero_grad()
             logits = forward_logits(model, flat.to(device))
-            if aggregation == "subject":
-                subj = subject_logits(logits, x.shape[0], windows)
-                ty = y.to(device)
-                if loss == "bce":
-                    y_smooth = ty.float() * 0.95 + 0.025
-                    tloss = criterion(subj[:, 1], y_smooth)
-                else:
-                    tloss = criterion(subj, ty)
-                tloss.backward()
-                optimizer.step()
-                tr_loss += tloss.item() * len(ty)
-                tr_correct += (subj.argmax(1) == ty).sum().item()
-                tr_total += len(ty)
-            else:
-                yf = expand_labels(y, windows).to(device)
-                tloss = step_loss(criterion, logits, yf, loss)
-                tloss.backward()
-                optimizer.step()
-                tr_loss += tloss.item() * len(yf)
-                tr_correct += (logits.argmax(1) == yf).sum().item()
-                tr_total += len(yf)
+            tloss = step_loss(criterion, logits, yf, loss)
+            tloss.backward()
+            optimizer.step()
+            tr_loss += tloss.item() * len(yf)
+            tr_correct += (logits.argmax(1) == yf).sum().item()
+            tr_total += len(yf)
 
         model.eval()
         val_loss, val_true, val_pred = 0.0, [], []
@@ -323,7 +302,6 @@ def refit_model(
     loss: str,
     norm: str,
     bce_pos_weight: bool = True,
-    aggregation: str = "window",
 ) -> tuple[torch.nn.Module, torch.Tensor, torch.Tensor]:
     """Retrain ``model`` on train+val for exactly ``epochs`` epochs (no early stop)."""
     x = torch.cat([train_loader.dataset.X, val_loader.dataset.X])
@@ -352,19 +330,10 @@ def refit_model(
     for _ in range(epochs):
         for _, xb, yb in loader:
             flat, windows = preprocess(xb, mean, std, norm)
+            yf = expand_labels(yb, windows).to(device)
             optimizer.zero_grad()
             logits = forward_logits(model, flat.to(device))
-            if aggregation == "subject":
-                subj = subject_logits(logits, xb.shape[0], windows)
-                ty = yb.to(device)
-                if loss == "bce":
-                    y_smooth = ty.float() * 0.95 + 0.025
-                    tloss = criterion(subj[:, 1], y_smooth)
-                else:
-                    tloss = criterion(subj, ty)
-            else:
-                yf = expand_labels(yb, windows).to(device)
-                tloss = step_loss(criterion, logits, yf, loss)
+            tloss = step_loss(criterion, logits, yf, loss)
             tloss.backward()
             optimizer.step()
     return model, mean, std
@@ -409,9 +378,6 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--channels", type=str, default="10-20",
                         choices=["all", "10-20", "f64"])
     parser.add_argument("--overlap", type=float, default=0.5)
-    parser.add_argument("--window-sec", type=float, default=2.0,
-                        help="Window length in seconds (e.g. 4.0 for longer "
-                             "temporal context)")
     parser.add_argument("--model", type=str, default="cnn_lstm",
                         choices=sorted(MODEL_CLASSES))
     parser.add_argument("--loss", type=str, default="bce",
@@ -421,14 +387,6 @@ def parse_args() -> argparse.Namespace:
                         choices=["fold", "subject"],
                         help="Normalization: fold (per-channel train stats) "
                              "or subject (per-subject z-score)")
-    parser.add_argument("--aggregation", type=str, default="window",
-                        choices=["window", "subject"],
-                        help="Loss aggregation: window (BCE per window, "
-                             "correlated pseudo-samples) or subject "
-                             "(mean window logits -> one BCE per subject)")
-    parser.add_argument("--scheduler-patience", type=int, default=15,
-                        help="ReduceLROnPlateau patience (epochs of no "
-                             "improvement before halving LR)")
     parser.add_argument("--early-stop-on", type=str, default="window-bacc",
                         choices=["subject-bacc", "window-bacc"],
                         help="Validation signal for scheduler + best-epoch "
@@ -450,10 +408,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--label-smoothing", type=float, default=0.05)
     parser.add_argument("--refit", action="store_true",
                         help="Retrain final model on train+val before testing")
-    parser.add_argument("--refit-min-epochs", type=int, default=10,
-                        help="Minimum best_epoch for which refit runs; if "
-                             "best_epoch is below this, keep the best checkpoint "
-                             "from fold training instead of refitting from scratch")
+    parser.add_argument("--refit-epochs", type=int, default=60,
+                        help="Fixed number of epochs to retrain the final model "
+                             "on train+val. Decoupled from the (noisy) best "
+                             "val epoch so the tested model is actually trained")
     parser.add_argument("--output-root", type=str, default=str(DEFAULT_OUTPUT_ROOT))
     parser.add_argument("--save-model", action="store_true")
     return parser.parse_args()
@@ -465,8 +423,7 @@ def main() -> None:
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
     
-    ds = MODMADataset(channels=args.channels, overlap=args.overlap,
-                      window_sec=args.window_sec)
+    ds = MODMADataset(channels=args.channels, overlap=args.overlap)
     n_channels = len(ds.channel_names)
     n_samples = ds.samples[0]["eeg"].shape[-1]
 
@@ -536,11 +493,9 @@ def main() -> None:
                 "early_stop_on": args.early_stop_on,
                 "bce_pos_weight": not args.no_bce_pos_weight,
                 "refit": args.refit,
-                "refit_min_epochs": args.refit_min_epochs,
+                "refit_epochs": args.refit_epochs,
                 "loss": args.loss,
                 "norm": args.norm,
-                "aggregation": args.aggregation,
-                "scheduler_patience": args.scheduler_patience,
             },
             "model": {
                 "constructor": {
@@ -581,9 +536,7 @@ def main() -> None:
               f"batch={args.batch_size} lr={args.lr} wd={args.weight_decay} "
               f"dropout={args.dropout} label_smoothing={args.label_smoothing} "
               f"patience={args.patience} es={args.early_stop_on} "
-              f"bce_pw={not args.no_bce_pos_weight} "
-              f"aggregation={args.aggregation} "
-              f"sched_patience={args.scheduler_patience}")
+              f"bce_pw={not args.no_bce_pos_weight}")
         print(f" MODEL PARAMS         : total={total:,} trainable={trainable:,} frozen={frozen:,}")
         print("=" * 78)
 
@@ -632,21 +585,18 @@ def main() -> None:
                 mean, std, args.label_smoothing, args.loss, args.norm,
                 early_stop_on=args.early_stop_on,
                 bce_pos_weight=not args.no_bce_pos_weight,
-                aggregation=args.aggregation,
-                scheduler_patience=args.scheduler_patience,
             )
 
-            if args.refit and best_epoch >= args.refit_min_epochs:
+            if args.refit:
                 model, mean, std = refit_model(
                     build_model(
                         args.model, n_channels, n_classes=2, n_samples=n_samples,
                         dropout=args.dropout,
                     ).to(device),
-                    train_loader, val_loader, best_epoch, args.lr,
+                    train_loader, val_loader, args.refit_epochs, args.lr,
                     args.weight_decay, device, args.label_smoothing,
                     args.batch_size, args.loss, args.norm,
                     bce_pos_weight=not args.no_bce_pos_weight,
-                    aggregation=args.aggregation,
                 )
             train_subjects = (
                 (list(train_loader.dataset.names)
