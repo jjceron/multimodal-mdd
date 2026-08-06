@@ -1,12 +1,19 @@
 """DeepConvNet (Schirrmeister et al., 2017) adapted for MODMA EEG.
 
-Structure follows the original paper: block1 stacks a temporal convolution with
-a spatial (channel-wise) convolution before BatchNorm/ELU/max-pooling; the
-following blocks are temporal convolutions with BatchNorm, ELU and max-pooling.
+This is a hybrid: it keeps the capacity of the historically best-performing
+configuration on this dataset (block filters 4/8/16/64, which reached BACC
+0.602 on seed 42) while incorporating the structural fixes proven by the
+paper-faithful rework:
 
-Adaptations for 2s @ 250 Hz windows (500 samples) and the small dataset: filter
-counts are halved (8/16/32/64 vs 25/25/50/100/200) and the two last pools use
-kernel 2 so the classifier keeps more temporal resolution (500 -> 7).
+  * ``padding="same"`` on every temporal convolution, so temporal resolution is
+    preserved until pooling (the old model collapsed the time axis too early).
+  * the channel-wise (spatial) convolution lives inside block1, right after the
+    first temporal convolution, matching the original paper layout.
+  * final max-pools of 2 instead of 3 so a 2 s @ 250 Hz window (500 samples)
+    is pooled to 7 temporal steps instead of collapsing to ~1 step.
+
+``fc_features`` is derived from a dummy forward pass, so the model adapts to
+any ``n_samples`` (e.g. 1000 for 4 s windows) with no extra parameters.
 """
 
 from __future__ import annotations
@@ -45,10 +52,10 @@ class DeepConvNet(nn.Module):
     ) -> None:
         super().__init__()
 
-        self.block1 = _block(1, 8, n_channels, (1, 4), dropout, first=True)
-        self.block2 = _block(8, 16, n_channels, (1, 4), dropout)
-        self.block3 = _block(16, 32, n_channels, (1, 2), dropout)
-        self.block4 = _block(32, 64, n_channels, (1, 2), dropout)
+        self.block1 = _block(1, 4, n_channels, (1, 4), dropout, first=True)
+        self.block2 = _block(4, 8, n_channels, (1, 4), dropout)
+        self.block3 = _block(8, 16, n_channels, (1, 2), dropout)
+        self.block4 = _block(16, 64, n_channels, (1, 2), dropout)
 
         dummy = torch.randn(1, 1, n_channels, n_samples)
         with torch.no_grad():

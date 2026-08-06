@@ -374,6 +374,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--channels", type=str, default="10-20",
                         choices=["all", "10-20", "f64"])
     parser.add_argument("--overlap", type=float, default=0.5)
+    parser.add_argument("--window-sec", type=float, default=2.0,
+                        help="Window length in seconds (e.g. 4.0 for longer "
+                             "temporal context)")
     parser.add_argument("--model", type=str, default="cnn_lstm",
                         choices=sorted(MODEL_CLASSES))
     parser.add_argument("--loss", type=str, default="bce",
@@ -419,7 +422,8 @@ def main() -> None:
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
     
-    ds = MODMADataset(channels=args.channels, overlap=args.overlap)
+    ds = MODMADataset(channels=args.channels, overlap=args.overlap,
+                      window_sec=args.window_sec)
     n_channels = len(ds.channel_names)
     n_samples = ds.samples[0]["eeg"].shape[-1]
 
