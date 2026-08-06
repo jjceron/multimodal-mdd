@@ -450,7 +450,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--label-smoothing", type=float, default=0.05)
     parser.add_argument("--refit", action="store_true",
                         help="Retrain final model on train+val before testing")
-    parser.add_argument("--refit-min-epochs", type=int, default=15,
+    parser.add_argument("--refit-min-epochs", type=int, default=10,
                         help="Minimum best_epoch for which refit runs; if "
                              "best_epoch is below this, keep the best checkpoint "
                              "from fold training instead of refitting from scratch")
