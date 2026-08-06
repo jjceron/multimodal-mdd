@@ -10,7 +10,6 @@ import mne
 import numpy as np
 import pandas as pd
 import torch
-from scipy import signal as sps
 from sklearn.model_selection import StratifiedGroupKFold
 from torch.utils.data import DataLoader, Dataset
 
@@ -48,10 +47,6 @@ class MODMADataset(Dataset):
         window_sec: float = 2.0,
         overlap: float = 0.5,
         reference: str = "average",
-        representation: str = "time",
-        n_fft: int = 256,
-        hop: int = 32,
-        baseline_correction: bool = False,
     ):
         self.root = Path(root)
         self.channels = channels
@@ -59,9 +54,6 @@ class MODMADataset(Dataset):
         self.target_fs = None if target_fs is None else float(target_fs)
         self.window_sec, self.overlap = window_sec, overlap
         self.reference = reference
-        self.representation = representation
-        self.n_fft, self.hop = int(n_fft), int(hop)
-        self.baseline_correction = baseline_correction
 
         if not self.root.exists():
             raise FileNotFoundError(f"MODMA root does not exist: {self.root}")
@@ -162,10 +154,6 @@ class MODMADataset(Dataset):
             raw.get_data().astype(np.float32), nan=0.0, posinf=0.0, neginf=0.0
         )
         windows = _window(eeg, fs, self.window_sec, self.overlap)
-        if self.baseline_correction:
-            windows = windows - windows.mean(axis=-1, keepdims=True)
-        if self.representation == "stft":
-            windows = self._to_spectrogram(windows, fs)
         return windows
 
     def _set_reference(self, raw: mne.io.BaseRaw) -> None:
@@ -180,30 +168,6 @@ class MODMADataset(Dataset):
             raw.set_eeg_reference(ref_channels=[cz], verbose=False)
         else:
             raw.set_eeg_reference("average", verbose=False)
-
-    def _to_spectrogram(self, windows: np.ndarray, fs: float) -> np.ndarray:
-        """[W, C, T] -> [W, C, F, T_spec] log-magnitude STFT.
-
-        Frequencies are cropped to the band-pass range (``highcut``) so the
-        spectrogram only spans the informative band. Mirrors the STFT step of
-        Yousufi et al. (2024), adapted to our 2 s windows.
-        """
-        noverlap = self.n_fft - self.hop
-        freqs, _, zxx = sps.stft(
-            windows,
-            fs=fs,
-            window="hann",
-            nperseg=self.n_fft,
-            noverlap=noverlap,
-            nfft=self.n_fft,
-            axis=-1,
-            boundary=None,
-            padded=False,
-        )
-        mag = np.abs(zxx).astype(np.float32)
-        fmax = self.highcut if self.highcut is not None else fs / 2.0
-        mag = mag[:, :, freqs <= fmax, :]
-        return np.log1p(mag)
 
     def __len__(self) -> int:
         return len(self.samples)
@@ -326,11 +290,6 @@ def parse_args():
     parser.add_argument("--overlap", type=float, default=0.5)
     parser.add_argument("--reference", type=str, default="average",
                         choices=["average", "cz"])
-    parser.add_argument("--representation", type=str, default="time",
-                        choices=["time", "stft"])
-    parser.add_argument("--n-fft", type=int, default=256)
-    parser.add_argument("--hop", type=int, default=32)
-    parser.add_argument("--baseline-correction", action="store_true")
     parser.add_argument("--split-seed", type=int, default=2509)
     parser.add_argument("--show-subjects", action="store_true")
     return parser.parse_args()
@@ -348,10 +307,6 @@ def main():
         window_sec=args.window_sec,
         overlap=args.overlap,
         reference=args.reference,
-        representation=args.representation,
-        n_fft=args.n_fft,
-        hop=args.hop,
-        baseline_correction=args.baseline_correction,
     )
 
     n_windows = sum(s["eeg"].shape[0] for s in ds.samples)
