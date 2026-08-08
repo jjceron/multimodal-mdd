@@ -163,6 +163,19 @@ def subject_prob(logits: torch.Tensor, n_subjects: int, windows: int) -> torch.T
     return logits_subj.softmax(dim=1)[:, 1]
 
 
+def attention_subject_prob(model: torch.nn.Module, x: torch.Tensor,
+                           mean: torch.Tensor, std: torch.Tensor, device: str,
+                           names, eng_by_name: dict[str, np.ndarray] | None) -> torch.Tensor:
+    """Per-subject class-1 probabilities via learned attention pooling.
+
+    Only valid for ``EEGBackbone`` with ``pool="attention"``.
+    """
+    xn = preprocess_subject(x, mean, std)
+    x_eng = batch_x_eng(list(names), eng_by_name, device) if eng_by_name is not None else None
+    sub_logits = model.subject_logits(xn.to(device), x_eng=x_eng).cpu()
+    return sub_logits.softmax(dim=1)[:, 1]
+
+
 def forward_batch(model: torch.nn.Module, x: torch.Tensor, y: torch.Tensor,
                   mean: torch.Tensor, std: torch.Tensor, device: str,
                   names=None, eng_by_name: dict[str, np.ndarray] | None = None):
@@ -203,6 +216,7 @@ def build_model(
     hidden: int = 32,
     n_filters: int = 16,
     engineered_dim: int = 17,
+    pool: str = "mean",
 ) -> torch.nn.Module:
     cls = MODEL_CLASSES[name]
     return cls(
@@ -210,7 +224,8 @@ def build_model(
         n_classes=n_classes,
         n_samples=n_samples,
         dropout=dropout,
-        **({"hidden": hidden, "n_filters": n_filters, "engineered_dim": engineered_dim}
+        **({"hidden": hidden, "n_filters": n_filters, "engineered_dim": engineered_dim,
+            "pool": pool}
            if name == "eeg_backbone" else {}),
     )
 
@@ -286,7 +301,13 @@ def train_fold(
             tloss = step_loss(criterion, logits, yf, loss)
             if consistency_coef > 0 and getattr(model, "full_subject_input", False):
                 n_subjects, windows = x.shape[0], x.shape[1]
-                subj_logits = logits.view(n_subjects, windows, -1).mean(dim=1)
+                if getattr(model, "sub_att", None) is not None:
+                    subj_logits = model.subject_logits(
+                        preprocess_subject(x, mean, std).to(device),
+                        x_eng=batch_x_eng(list(name), eng_by_name, device),
+                    )
+                else:
+                    subj_logits = logits.view(n_subjects, windows, -1).mean(dim=1)
                 y_subj = (y.float() * 0.95 + 0.025).to(device)
                 tloss = tloss + consistency_coef * criterion(subj_logits[:, 1], y_subj)
             tloss.backward()
@@ -314,7 +335,12 @@ def train_fold(
                     windows = x.shape[1]
                     val_true.extend(yf_cpu.tolist())
                     val_pred.extend(logits.argmax(1).cpu().tolist())
-                    subj_prob = subject_prob(logits, x.shape[0], windows)
+                    if getattr(model, "sub_att", None) is not None:
+                        subj_prob = attention_subject_prob(
+                            model, x, mean, std, device, name, eng_by_name
+                        )
+                    else:
+                        subj_prob = subject_prob(logits, x.shape[0], windows)
                     val_subj_true.extend(y.cpu().tolist())
                     val_subj_pred.extend((subj_prob >= 0.5).long().cpu().tolist())
 
@@ -421,7 +447,13 @@ def refit_model(
             tloss = step_loss(criterion, logits, yf, loss)
             if consistency_coef > 0 and getattr(model, "full_subject_input", False):
                 n_subjects, windows = xb.shape[0], xb.shape[1]
-                subj_logits = logits.view(n_subjects, windows, -1).mean(dim=1)
+                if getattr(model, "sub_att", None) is not None:
+                    subj_logits = model.subject_logits(
+                        preprocess_subject(xb, mean, std).to(device),
+                        x_eng=batch_x_eng(list(name), eng_by_name, device),
+                    )
+                else:
+                    subj_logits = logits.view(n_subjects, windows, -1).mean(dim=1)
                 y_subj = (yb.float() * 0.95 + 0.025).to(device)
                 tloss = tloss + consistency_coef * criterion(subj_logits[:, 1], y_subj)
             tloss.backward()
@@ -454,7 +486,10 @@ def run_fold_test(model: torch.nn.Module, test_loader, device: str,
                 yf = expand_labels(y, windows)
                 true_win.extend(yf.tolist())
                 pred_win.extend(logits.argmax(1).tolist())
-                prob = subject_prob(logits, x.shape[0], windows)
+                if getattr(model, "sub_att", None) is not None:
+                    prob = attention_subject_prob(model, x, mean, std, device, name, eng_by_name)
+                else:
+                    prob = subject_prob(logits, x.shape[0], windows)
                 true_subj.extend(y.numpy().tolist())
                 pred_subj.extend((prob >= 0.5).long().numpy().tolist())
                 prob_subj.extend(prob.numpy().tolist())
@@ -530,7 +565,8 @@ def parse_args() -> argparse.Namespace:
                         help="Disable class-balanced pos_weight in BCE")
     parser.add_argument("--consistency-coef", type=float, default=0.0,
                         help="Weight of the subject-consistency auxiliary BCE "
-                             "on per-subject pooled logits (0 = disabled)")
+                             "on per-subject pooled logits (0 = disabled; "
+                             "REQUIRED >0 to train --pool attention weights)")
     parser.add_argument("--k", type=int, default=5)
     parser.add_argument("--inner-splits", type=int, default=5)
     parser.add_argument("--split-seed", type=int, nargs="+", default=[2509])
@@ -542,6 +578,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--weight-decay", type=float, default=5e-3)
     parser.add_argument("--patience", type=int, default=40)
     parser.add_argument("--dropout", type=float, default=0.4)
+    parser.add_argument("--pool", type=str, default="mean",
+                        choices=["mean", "attention"],
+                        help="Subject pooling for eeg_backbone embeddings/eval: "
+                             "mean (validated, reproducible) or attention "
+                             "(learned per-window weights)")
     parser.add_argument("--label-smoothing", type=float, default=0.05)
     parser.add_argument("--refit", action="store_true",
                         help="Retrain final model on train+val before testing")
@@ -557,6 +598,12 @@ def parse_args() -> argparse.Namespace:
 def main() -> None:
     args = parse_args()
     set_seed(args.seed)
+
+    if args.pool == "attention" and args.consistency_coef == 0:
+        raise SystemExit(
+            "ERROR: --pool attention requires --consistency-coef > 0 "
+            "(the per-window loss does not train the subject-attention weights)."
+        )
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
     
@@ -579,7 +626,7 @@ def main() -> None:
     model_hdr = build_model(
         args.model, n_channels, n_classes=2, n_samples=n_samples,
         dropout=args.dropout, hidden=args.hidden, n_filters=args.n_filters,
-        engineered_dim=engineered_dim,
+        engineered_dim=engineered_dim, pool=args.pool,
     )
     total, trainable, frozen = count_parameters(model_hdr)
     gpu = torch.cuda.get_device_name(0) if torch.cuda.is_available() else "CPU"
@@ -641,6 +688,7 @@ def main() -> None:
                 "patience": args.patience,
                 "class_weighted_loss": args.loss == "ce",
                 "early_stop_on": args.early_stop_on,
+                "subject_pool": args.pool,
                 "bce_pos_weight": not args.no_bce_pos_weight,
                 "consistency_coef": args.consistency_coef,
                 "refit": args.refit,
@@ -688,7 +736,7 @@ def main() -> None:
               f"batch={args.batch_size} lr={args.lr} wd={args.weight_decay} "
               f"dropout={args.dropout} label_smoothing={args.label_smoothing} "
               f"patience={args.patience} es={args.early_stop_on} "
-              f"bce_pw={not args.no_bce_pos_weight}")
+              f"bce_pw={not args.no_bce_pos_weight} pool={args.pool}")
         print(f" MODEL PARAMS         : total={total:,} trainable={trainable:,} frozen={frozen:,}")
         print("=" * 78)
 
@@ -732,7 +780,7 @@ def main() -> None:
             model = build_model(
                 args.model, n_channels, n_classes=2, n_samples=n_samples,
                 dropout=args.dropout, hidden=args.hidden, n_filters=args.n_filters,
-                engineered_dim=engineered_dim,
+                engineered_dim=engineered_dim, pool=args.pool,
             ).to(device)
 
             history, best_epoch = train_fold(
@@ -750,7 +798,7 @@ def main() -> None:
                     build_model(
                         args.model, n_channels, n_classes=2, n_samples=n_samples,
                         dropout=args.dropout, hidden=args.hidden, n_filters=args.n_filters,
-                        engineered_dim=engineered_dim,
+                        engineered_dim=engineered_dim, pool=args.pool,
                     ).to(device),
                     train_loader, val_loader, args.refit_epochs, args.lr,
                     args.weight_decay, device, args.label_smoothing,

@@ -20,8 +20,9 @@ Design rationale (régimen: 53 subjects, ~33 train per fold):
      finds no signal without losing the engineered one.
 
 ``forward`` returns per-window logits ``[S*W, n_classes]`` (so the window
-   training loop provides ~10k samples); evaluation pools per subject via mean
-   softmax. ``forward_features`` returns the subject-level ``z_eeg [S, 2h]``
+   training loop provides ~10k samples); evaluation pools per subject via
+   ``_pool_subjects`` (mean or learned per-window attention, ``pool=``).
+   ``forward_features`` returns the subject-level ``z_eeg [S, 2h]``
    for the future cross-modal fusion.
 
    The engineered branch receives **pre-computed, per-fold scaled** features
@@ -92,10 +93,12 @@ class EEGBackbone(nn.Module):
         hidden: int = 32,
         engineered_dim: int = 17,
         n_filters: int = 16,
+        pool: str = "mean",
     ) -> None:
         super().__init__()
         self.engineered_dim = engineered_dim
         self.full_subject_input = True  # expects [S, W, C, T] + x_eng [S, engineered_dim]
+        self.pool = pool
 
         self.cnn = SpectralConvNet(
             n_channels=n_channels, n_samples=n_samples,
@@ -109,6 +112,10 @@ class EEGBackbone(nn.Module):
         self.z_norm = nn.LayerNorm(hidden * 2)
         self.head = nn.Linear(hidden * 2, n_classes)
         self.drop = nn.Dropout(dropout) if dropout > 0 else nn.Identity()
+
+        # subject-level pooling: learned per-window attention (pool="attention")
+        # or mean pooling (pool="mean", the validated default).
+        self.sub_att = nn.Linear(hidden * 2, 1, bias=False) if pool == "attention" else None
 
         self._z_eeg: torch.Tensor | None = None
 
@@ -134,9 +141,28 @@ class EEGBackbone(nn.Module):
         return self.head(self.drop(z))
 
     def forward_features(self, x: torch.Tensor, x_eng: torch.Tensor | None = None) -> torch.Tensor:
-        """Subject-level embedding ``z_eeg [S, 2h]`` (mean-pooled over windows)."""
+        """Subject-level embedding ``z_eeg [S, 2h]`` (mean or attention pooling)."""
         z = self._window_z(x, x_eng)
         S, W = x.shape[0], x.shape[1]
-        z_subj = z.view(S, W, -1).mean(dim=1)
+        z_subj = self._pool_subjects(z, S, W)
         self._z_eeg = z_subj
         return z_subj
+
+    def _pool_subjects(self, z: torch.Tensor, S: int, W: int) -> torch.Tensor:
+        """Aggregate per-window ``z [S*W, 2h]`` into subject ``[S, 2h]``.
+
+        ``mean`` reproduces the validated pooling; ``attention`` weights each
+        window by a learned scalar (softmax over the subject's windows).
+        """
+        if self.sub_att is None:
+            return z.view(S, W, -1).mean(dim=1)
+        a = self.sub_att(z.view(S, W, -1)).squeeze(-1)           # [S, W]
+        a = torch.softmax(a, dim=1)                              # [S, W]
+        return (a.unsqueeze(-1) * z.view(S, W, -1)).sum(dim=1)  # [S, 2h]
+
+    def subject_logits(self, x: torch.Tensor, x_eng: torch.Tensor | None = None) -> torch.Tensor:
+        """Subject-level logits ``[S, n_classes]`` via the same subject pooling."""
+        z = self._window_z(x, x_eng)
+        S, W = x.shape[0], x.shape[1]
+        z_subj = self._pool_subjects(z, S, W)
+        return self.head(self.drop(z_subj))
