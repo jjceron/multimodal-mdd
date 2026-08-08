@@ -271,7 +271,6 @@ def train_fold(
         "val_subj_f1": [],
         "val_subj_sens": [],
         "val_subj_spec": [],
-        "val_subj_auc": [],
     }
 
     best_val_bacc, best_state, best_epoch, patience_left = -1.0, None, 0, 0
@@ -298,7 +297,7 @@ def train_fold(
 
         model.eval()
         val_loss, val_true, val_pred = 0.0, [], []
-        val_subj_true, val_subj_pred, val_subj_prob = [], [], []
+        val_subj_true, val_subj_pred = [], []
         with torch.no_grad():
             for name, x, y in val_loader:
                 logits, yf = forward_batch(model, x, y, mean, std, device,
@@ -310,7 +309,6 @@ def train_fold(
                     val_subj_true.extend(y.tolist())
                     prob = logits.softmax(dim=1)[:, 1].cpu()
                     val_subj_pred.extend((prob >= 0.5).long().tolist())
-                    val_subj_prob.extend(prob.tolist())
                 else:
                     yf_cpu = yf
                     windows = x.shape[1]
@@ -319,17 +317,12 @@ def train_fold(
                     subj_prob = subject_prob(logits, x.shape[0], windows)
                     val_subj_true.extend(y.cpu().tolist())
                     val_subj_pred.extend((subj_prob >= 0.5).long().cpu().tolist())
-                    val_subj_prob.extend(subj_prob.cpu().tolist())
 
         tr_acc = tr_correct / max(tr_total, 1)
         tr_loss /= max(tr_total, 1)
         val_loss /= max(len(val_true), 1)
         vl_m = logger.metrics(val_true, val_pred)
         vs_m = logger.metrics(val_subj_true, val_subj_pred)
-        vs_auc = (
-            float(roc_auc_score(val_subj_true, val_subj_prob))
-            if len(set(val_subj_true)) > 1 else None
-        )
 
         history["train_loss"].append(tr_loss)
         history["val_loss"].append(val_loss)
@@ -343,7 +336,6 @@ def train_fold(
         history["val_subj_f1"].append(vs_m["f1"])
         history["val_subj_sens"].append(vs_m["sens"])
         history["val_subj_spec"].append(vs_m["spec"])
-        history["val_subj_auc"].append(vs_auc)
 
         es_metric = vs_m["bacc"] if early_stop_on == "subject-bacc" else vl_m["bacc"]
         scheduler.step(es_metric)
@@ -357,8 +349,7 @@ def train_fold(
             patience_left += 1
 
         logger.log_epoch(
-            epoch, tr_loss, val_loss, {"acc": tr_acc}, vl_m, patience_left,
-            vs_m=vs_m, vs_auc=vs_auc,
+            epoch, tr_loss, val_loss, {"acc": tr_acc}, vl_m, patience_left
         )
 
         if patience_left >= patience:
