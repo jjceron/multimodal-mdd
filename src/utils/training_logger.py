@@ -39,16 +39,23 @@ class ClassificationLogger:
         print(
             f"  {'Epoch':>5s} | {'T_loss':>8s} {'V_loss':>8s} "
             f"{'T_acc':>6s} {'V_acc':>6s} | "
-            f"{'V_bacc':>6s} {'V_f1':>6s} {'V_sens':>6s} {'V_spec':>6s} | pat"
+            f"{'V_bacc':>6s} {'V_f1':>6s} {'V_sens':>6s} {'V_spec':>6s} | "
+            f"{'S_bacc':>6s} {'S_sens':>6s} {'S_spec':>6s} {'S_auc':>6s} | pat"
         )
 
     @staticmethod
-    def log_epoch(epoch, tr_loss, vl_loss, tr_m, vl_m, patience):
+    def log_epoch(epoch, tr_loss, vl_loss, tr_m, vl_m, patience,
+                  vs_m=None, vs_auc=None):
+        s_bacc = f"{vs_m['bacc']:6.3f}" if vs_m is not None else "    - "
+        s_sens = f"{vs_m['sens']:6.3f}" if vs_m is not None else "    - "
+        s_spec = f"{vs_m['spec']:6.3f}" if vs_m is not None else "    - "
+        s_auc = f"{vs_auc:.3f}" if vs_auc is not None else "  -  "
         print(
             f"  {epoch:5d} | {tr_loss:8.4f} {vl_loss:8.4f} "
             f"{tr_m['acc']:6.3f} {vl_m['acc']:6.3f} | "
             f"{vl_m['bacc']:6.3f} {vl_m['f1']:6.3f} "
-            f"{vl_m['sens']:6.3f} {vl_m['spec']:6.3f} | {patience:2d}"
+            f"{vl_m['sens']:6.3f} {vl_m['spec']:6.3f} | "
+            f"{s_bacc} {s_sens} {s_spec} {s_auc} | {patience:2d}"
         )
 
     def log_fold_test(self, test_true, test_pred, test_auc=None):
