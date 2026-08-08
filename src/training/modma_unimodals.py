@@ -26,7 +26,6 @@ from src.features.eeg_features import subject_features
 from src.models.deepconvnet import DeepConvNet
 from src.models.eeg_backbone import EEGBackbone
 from src.preprocessing.modma_eeg import MODMADataset, create_dataloaders
-from src.training.subject_classification import run_subject_cv
 from src.utils.get_seed import set_seed
 from src.utils.training_logger import ClassificationLogger
 
@@ -103,7 +102,7 @@ def fit_eng_scaler(eng_feats: dict[str, np.ndarray],
                    train_names, val_names) -> dict[str, np.ndarray]:
     """Fit StandardScaler on train+val subjects only -> scaled {id: row}.
 
-    Leak-free: the scaler never sees test subjects (same contract as the probe).
+    Leak-free: the scaler never sees test subjects.
     """
     rows = np.stack([eng_feats[n] for n in (list(train_names) + list(val_names))])
     scaler = StandardScaler().fit(rows)
@@ -588,16 +587,6 @@ def main() -> None:
     for split_seed in args.split_seed:
         print(f"\n{'=' * 78}\n  SPLIT SEED            : {split_seed}\n{'=' * 78}")
 
-        probe = run_subject_cv(
-            ds, k=args.k, inner_k=args.inner_splits, split_seed=split_seed
-        )
-        ps = probe["summary"]
-        print(
-            "  probe baseline      : BACC "
-            f"{ps['bacc_mean']:.3f}+/-{ps['bacc_std']:.3f}  "
-            f"AUC {ps['auc_mean'] if ps['auc_mean'] is None else round(ps['auc_mean'], 3)}"
-        )
-
         folds = create_dataloaders(
             ds,
             k_folder=args.k,
@@ -711,7 +700,6 @@ def main() -> None:
             config=config,
             results_folds=results_folds,
             out_dir=out_dir,
-            probe=probe,
         ) -> None:
             results = {
                 "modal": args.modal,
@@ -723,7 +711,6 @@ def main() -> None:
                 "n_channels": n_channels,
                 "n_samples": n_samples,
                 "config": config,
-                "baseline_probe": probe["summary"],
                 "folds": results_folds,
             }
             with open(out_dir / "results.json", "w") as f:
