@@ -9,10 +9,13 @@ Design rationale (régimen: 53 subjects, ~33 train per fold):
    descriptors (engineered probe). So the model:
 
   1. **SpectralConvNet (CNN branch)** — a light, EEGNet-style depthwise
-     convolutional encoder over the *time axis* that learns spectral filters;
-     energy (``mean(x**2)`` + log) is pooled over time per filter, giving a
-     per-window learned-band descriptor. It has ~6k params and is trained on
-     **per-window** samples (~10k windows), evaluated at subject level.
+     convolutional encoder over the *time axis* that learns spectral filters
+     (multi-scale narrow/long kernels); per filter it pools log band-energy and
+     log temporal-dynamics over time, giving a per-window learned-band
+     descriptor. It has ~7k params and is trained on **per-window** samples
+     (~10k windows), evaluated at subject level.
+  2. **Engineered branch** — the static 17 subject-level features computed on
+     the RAW windows (same descriptors as the validated probe).
   2. **Engineered branch** — the static subject-level features computed on
      the RAW windows (same descriptors as the validated probe).
   3. **Gate (learned)** — per-element ``sigmoid`` weights between the CNN and
@@ -39,7 +42,11 @@ from torch.nn import functional as F
 
 
 class SpectralConvNet(nn.Module):
-    """Per-window learned spectral encoder (depthwise over time axis).
+    """Per-window learned spectral encoder (multi-scale + temporal dynamics).
+
+    Two temporal branches over the raw window: a *narrow* kernel (short
+    spectral structure) and a *long* kernel (wide context), each collapsed to
+    log band-energy and log temporal-dynamics and concatenated.
 
     Input ``[B, C, T]`` -> per-window descriptor ``[B, hidden]``.
     """
@@ -54,7 +61,7 @@ class SpectralConvNet(nn.Module):
     ) -> None:
         super().__init__()
         depth = 4  # depthwise ratio
-        self.net = nn.Sequential(
+        self.narrow = nn.Sequential(
             nn.Conv1d(
                 n_channels, n_channels * depth,
                 kernel_size=32, padding=16, groups=n_channels,
@@ -65,13 +72,33 @@ class SpectralConvNet(nn.Module):
             nn.BatchNorm1d(n_filters),
             nn.ELU(),
         )
-        self.fc = nn.Linear(n_filters, hidden)
+        wide = min(128, n_samples)
+        self.wide = nn.Sequential(
+            nn.Conv1d(
+                n_channels, n_channels,
+                kernel_size=wide, padding=wide // 2, groups=n_channels,
+            ),
+            nn.BatchNorm1d(n_channels),
+            nn.ELU(),
+            nn.Conv1d(n_channels, n_filters, kernel_size=1),
+            nn.BatchNorm1d(n_filters),
+            nn.ELU(),
+        )
+        self.fc = nn.Linear(n_filters * 4, hidden)
         self.drop = nn.Dropout(dropout) if dropout > 0 else nn.Identity()
 
+    @staticmethod
+    def _band_stats(h: torch.Tensor) -> torch.Tensor:
+        """log band-energy + log temporal-dynamics from conv output ``[B, F, T]``."""
+        energy = torch.log1p(h.pow(2).mean(dim=2))
+        dynamics = torch.log1p(h.std(dim=2) + 1e-6)
+        return torch.cat([energy, dynamics], dim=-1)  # [B, 2F]
+
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        h = self.net(x)                      # [B, n_filters, T]
-        energy = torch.log1p(h.pow(2).mean(dim=2))  # [B, n_filters] log band energy
-        return self.drop(F.gelu(self.fc(energy)))
+        hn = self.narrow(x)  # [B, F, T]
+        hw = self.wide(x)    # [B, F, T]
+        feat = torch.cat([self._band_stats(hn), self._band_stats(hw)], dim=-1)
+        return self.drop(F.gelu(self.fc(feat)))
 
 
 class EEGBackbone(nn.Module):
