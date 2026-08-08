@@ -105,18 +105,9 @@ class EEGBackbone(nn.Module):
         self.eng_proj = nn.Linear(engineered_dim, hidden)
 
         self.gate = nn.Linear(hidden * 2, hidden)
+        self.z_norm = nn.LayerNorm(hidden * 2)
         self.head = nn.Linear(hidden * 2, n_classes)
         self.drop = nn.Dropout(dropout) if dropout > 0 else nn.Identity()
-
-        with torch.no_grad():
-            # Engine-first initialization: (1-g) closes to 1 at init so the
-            # validated engineered branch dominates; the CNN gate learns a
-            # residual contribution instead of being able to erase the signal.
-            self.gate.weight.normal_(0.0, 0.02)
-            self.gate.bias.fill_(-3.0)
-            # Decision point at init = 0.5 (bias 0). The threshold is then
-            # determined by the learned bias of the head (no external tuning).
-            self.head.bias.fill_(0.0)
 
         self._z_eeg: torch.Tensor | None = None
 
@@ -133,7 +124,7 @@ class EEGBackbone(nn.Module):
         z_eng = z_eng.repeat_interleave(W, dim=0)      # [S*W, h] (subject context)
 
         g = torch.sigmoid(self.gate(torch.cat([z_cnn, z_eng], dim=-1)))  # [S*W, h]
-        z = torch.cat([g * z_cnn, (1 - g) * z_eng], dim=-1)
+        z = self.z_norm(torch.cat([g * z_cnn, (1 - g) * z_eng], dim=-1))
         return z
 
     def forward(self, x: torch.Tensor, x_eng: torch.Tensor | None = None) -> torch.Tensor:

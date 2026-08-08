@@ -722,7 +722,10 @@ def main() -> None:
 
             if args.refit:
                 model, mean, std = refit_model(
-                    model,
+                    build_model(
+                        args.model, n_channels, n_classes=2, n_samples=n_samples,
+                        dropout=args.dropout, hidden=args.hidden, n_filters=args.n_filters,
+                    ).to(device),
                     train_loader, val_loader, args.refit_epochs, args.lr,
                     args.weight_decay, device, args.label_smoothing,
                     args.batch_size, args.loss,
