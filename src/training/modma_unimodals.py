@@ -88,10 +88,15 @@ def preprocess_subject(x: torch.Tensor, mean: torch.Tensor,
 
 
 def build_eng_feats(ds) -> dict[str, np.ndarray]:
-    """per-subject 17-dim engineered features: {participant_id: row}."""
+    """per-subject engineered features: {participant_id: row}."""
     _, _, X = subject_features(ds)
     subjects = [s["participant_id"] for s in ds.samples]
-    return {s: X[i] for i, s in enumerate(subjects)}
+    return {pid: X[i] for i, pid in enumerate(subjects)}
+
+
+def eng_dim(eng_by_name: dict[str, np.ndarray]) -> int:
+    """Dimensionality of the engineered feature rows."""
+    return int(next(iter(eng_by_name.values())).shape[0])
 
 
 def fit_eng_scaler(eng_feats: dict[str, np.ndarray],
@@ -106,7 +111,7 @@ def fit_eng_scaler(eng_feats: dict[str, np.ndarray],
 
 
 def batch_x_eng(names, eng_by_name: dict[str, np.ndarray], device: str) -> torch.Tensor:
-    """Scaled per-subject engineered rows for a batch: ``[B, 17]`` on device."""
+    """Scaled per-subject engineered rows for a batch: ``[B, engineered_dim]`` on device."""
     rows = np.stack([eng_by_name[n] for n in names])
     return torch.as_tensor(rows, dtype=torch.float32).to(device)
 
@@ -168,7 +173,7 @@ def forward_batch(model: torch.nn.Module, x: torch.Tensor, y: torch.Tensor,
     window). Subject-level models (``subject_level``) receive the full
     ``[S, W, C, T]`` and return one logit row per subject directly.
     ``full_subject_input`` models get the full normalized subject tensor and
-    the pre-scaled engineered features ``x_eng [S, 17]`` (per-fold
+    the pre-scaled engineered features ``x_eng [S, engineered_dim]`` (per-fold
     StandardScaler), returning per-window logits.
 
     Returns ``(logits, labels)`` both on ``device``.
@@ -198,6 +203,7 @@ def build_model(
     dropout: float,
     hidden: int = 32,
     n_filters: int = 16,
+    engineered_dim: int = 17,
 ) -> torch.nn.Module:
     cls = MODEL_CLASSES[name]
     return cls(
@@ -205,7 +211,8 @@ def build_model(
         n_classes=n_classes,
         n_samples=n_samples,
         dropout=dropout,
-        **({"hidden": hidden, "n_filters": n_filters} if name == "eeg_backbone" else {}),
+        **({"hidden": hidden, "n_filters": n_filters, "engineered_dim": engineered_dim}
+           if name == "eeg_backbone" else {}),
     )
 
 
@@ -240,6 +247,7 @@ def train_fold(
     early_stop_on: str = "window-bacc",
     bce_pos_weight: bool = True,
     eng_by_name: dict[str, np.ndarray] | None = None,
+    consistency_coef: float = 0.0,
 ) -> tuple[dict, int]:
     optimizer = torch.optim.AdamW(
         model.parameters(), lr=lr, weight_decay=weight_decay
@@ -277,6 +285,11 @@ def train_fold(
                                        names=name, eng_by_name=eng_by_name)
             optimizer.zero_grad()
             tloss = step_loss(criterion, logits, yf, loss)
+            if consistency_coef > 0 and getattr(model, "full_subject_input", False):
+                n_subjects, windows = x.shape[0], x.shape[1]
+                subj_logits = logits.view(n_subjects, windows, -1).mean(dim=1)
+                y_subj = y.float() * 0.95 + 0.025
+                tloss = tloss + consistency_coef * criterion(subj_logits[:, 1], y_subj)
             tloss.backward()
             optimizer.step()
             tr_loss += tloss.item() * len(yf)
@@ -374,6 +387,7 @@ def refit_model(
     loss: str,
     bce_pos_weight: bool = True,
     eng_by_name: dict[str, np.ndarray] | None = None,
+    consistency_coef: float = 0.0,
 ) -> tuple[torch.nn.Module, torch.Tensor, torch.Tensor]:
     """Retrain ``model`` on train+val for exactly ``epochs`` epochs (no early stop)."""
     x = torch.cat([train_loader.dataset.X, val_loader.dataset.X])
@@ -406,6 +420,11 @@ def refit_model(
                                        names=name, eng_by_name=eng_by_name)
             optimizer.zero_grad()
             tloss = step_loss(criterion, logits, yf, loss)
+            if consistency_coef > 0 and getattr(model, "full_subject_input", False):
+                n_subjects, windows = xb.shape[0], xb.shape[1]
+                subj_logits = logits.view(n_subjects, windows, -1).mean(dim=1)
+                y_subj = yb.float() * 0.95 + 0.025
+                tloss = tloss + consistency_coef * criterion(subj_logits[:, 1], y_subj)
             tloss.backward()
             optimizer.step()
     return model, mean, std
@@ -416,6 +435,7 @@ def run_fold_test(model: torch.nn.Module, test_loader, device: str,
                   eng_by_name: dict[str, np.ndarray] | None = None) -> dict:
     true_subj, pred_subj, prob_subj = [], [], []
     true_win, pred_win = [], []
+    emb_subj, emb_names = [], []
 
     model.eval()
     with torch.no_grad():
@@ -439,6 +459,12 @@ def run_fold_test(model: torch.nn.Module, test_loader, device: str,
                 true_subj.extend(y.numpy().tolist())
                 pred_subj.extend((prob >= 0.5).long().numpy().tolist())
                 prob_subj.extend(prob.numpy().tolist())
+                if eng_by_name is not None:
+                    x_eng_b = batch_x_eng(list(name), eng_by_name, device)
+                    xn = preprocess_subject(x, mean, std)
+                    emb = model.forward_features(xn.to(device), x_eng=x_eng_b)
+                    emb_subj.append(emb.detach().cpu().numpy())
+                    emb_names.extend(list(name))
             else:
                 flat, windows = preprocess(x, mean, std)
                 logits = forward_logits(model, flat.to(device)).cpu()
@@ -454,6 +480,8 @@ def run_fold_test(model: torch.nn.Module, test_loader, device: str,
     true, pred = np.asarray(true_subj), np.asarray(pred_subj)
     auc = float(roc_auc_score(true, prob_subj)) if len(set(true.tolist())) > 1 else None
 
+    z_eeg = np.concatenate(emb_subj, axis=0) if emb_subj else None
+
     return {
         "test_true": true.tolist(),
         "test_pred": pred.tolist(),
@@ -461,6 +489,8 @@ def run_fold_test(model: torch.nn.Module, test_loader, device: str,
         "test_cm_subject": confusion_matrix(true, pred),
         "test_roc": {"y_true": true.tolist(), "y_prob": prob_subj},
         "test_auc": auc,
+        "test_z_eeg": z_eeg.tolist() if z_eeg is not None else None,
+        "test_emb_subjects": emb_names if emb_names else None,
     }
 
 
@@ -499,6 +529,9 @@ def parse_args() -> argparse.Namespace:
                              "or window-bacc (window-level, more samples)")
     parser.add_argument("--no-bce-pos-weight", action="store_true",
                         help="Disable class-balanced pos_weight in BCE")
+    parser.add_argument("--consistency-coef", type=float, default=0.0,
+                        help="Weight of the subject-consistency auxiliary BCE "
+                             "on per-subject pooled logits (0 = disabled)")
     parser.add_argument("--k", type=int, default=5)
     parser.add_argument("--inner-splits", type=int, default=5)
     parser.add_argument("--split-seed", type=int, nargs="+", default=[2509])
@@ -540,12 +573,14 @@ def main() -> None:
     # window shape: [W, C, T]
     n_samples = ds.samples[0]["eeg"].shape[-1]
 
-    eng_feats = build_eng_feats(ds)  # deterministic per-subject 17-dim
+    eng_feats = build_eng_feats(ds)  # deterministic per-subject features
+    engineered_dim = eng_dim(eng_feats)
 
     windows = int(ds.samples[0]["eeg"].shape[0])
     model_hdr = build_model(
         args.model, n_channels, n_classes=2, n_samples=n_samples,
         dropout=args.dropout, hidden=args.hidden, n_filters=args.n_filters,
+        engineered_dim=engineered_dim,
     )
     total, trainable, frozen = count_parameters(model_hdr)
     gpu = torch.cuda.get_device_name(0) if torch.cuda.is_available() else "CPU"
@@ -618,6 +653,7 @@ def main() -> None:
                 "class_weighted_loss": args.loss == "ce",
                 "early_stop_on": args.early_stop_on,
                 "bce_pos_weight": not args.no_bce_pos_weight,
+                "consistency_coef": args.consistency_coef,
                 "refit": args.refit,
                 "refit_epochs": args.refit_epochs,
                 "loss": args.loss,
@@ -709,6 +745,7 @@ def main() -> None:
             model = build_model(
                 args.model, n_channels, n_classes=2, n_samples=n_samples,
                 dropout=args.dropout, hidden=args.hidden, n_filters=args.n_filters,
+                engineered_dim=engineered_dim,
             ).to(device)
 
             history, best_epoch = train_fold(
@@ -718,6 +755,7 @@ def main() -> None:
                 early_stop_on=args.early_stop_on,
                 bce_pos_weight=not args.no_bce_pos_weight,
                 eng_by_name=eng_by_name,
+                consistency_coef=args.consistency_coef,
             )
 
             if args.refit:
@@ -725,12 +763,14 @@ def main() -> None:
                     build_model(
                         args.model, n_channels, n_classes=2, n_samples=n_samples,
                         dropout=args.dropout, hidden=args.hidden, n_filters=args.n_filters,
+                        engineered_dim=engineered_dim,
                     ).to(device),
                     train_loader, val_loader, args.refit_epochs, args.lr,
                     args.weight_decay, device, args.label_smoothing,
                     args.batch_size, args.loss,
                     bce_pos_weight=not args.no_bce_pos_weight,
                     eng_by_name=eng_by_name,
+                    consistency_coef=args.consistency_coef,
                 )
             train_subjects = (
                 (list(train_loader.dataset.names)

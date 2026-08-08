@@ -6,14 +6,14 @@ Design rationale (régimen: 53 subjects, ~33 train per fold):
   pools the time axis and destroys the static spectral/topographic signal that
   this dataset actually contains — it collapsed to chance repeatedly.
 * The validated signal lives in *band-power/topography/dynamics/entropy*
-  descriptors (17-dim probe, AUC ~0.69). So the model:
+   descriptors (engineered probe). So the model:
 
   1. **SpectralConvNet (CNN branch)** — a light, EEGNet-style depthwise
      convolutional encoder over the *time axis* that learns spectral filters;
      energy (``mean(x**2)`` + log) is pooled over time per filter, giving a
      per-window learned-band descriptor. It has ~6k params and is trained on
      **per-window** samples (~10k windows), evaluated at subject level.
-  2. **Engineered branch** — the 17 static subject-level features computed on
+  2. **Engineered branch** — the static subject-level features computed on
      the RAW windows (same descriptors as the validated probe).
   3. **Gate (learned)** — per-element ``sigmoid`` weights between the CNN and
      engineered representations, so the model can *auto-limit* the CNN if it
@@ -79,7 +79,8 @@ class EEGBackbone(nn.Module):
 
     ``full_subject_input=True``: the training loop passes the whole subject
     tensor ``[S, W, C, T]`` (normalized) plus the pre-scaled subject-level
-    engineered features ``x_eng [S, 17]``; the model returns per-window logits.
+    engineered features ``x_eng [S, engineered_dim]``; the model returns
+    per-window logits.
     """
 
     def __init__(
@@ -94,7 +95,7 @@ class EEGBackbone(nn.Module):
     ) -> None:
         super().__init__()
         self.engineered_dim = engineered_dim
-        self.full_subject_input = True  # expects [S, W, C, T] + x_eng [S, 17]
+        self.full_subject_input = True  # expects [S, W, C, T] + x_eng [S, engineered_dim]
 
         self.cnn = SpectralConvNet(
             n_channels=n_channels, n_samples=n_samples,
