@@ -149,9 +149,15 @@ def expand_labels(y: torch.Tensor, windows: int) -> torch.Tensor:
 
 
 def subject_prob(logits: torch.Tensor, n_subjects: int, windows: int) -> torch.Tensor:
-    """Per-subject class-1 probability: softmax per window, then mean over windows."""
-    logits_subj = logits.view(n_subjects, windows, -1)
-    return logits_subj.softmax(dim=2)[:, :, 1].mean(dim=1)
+    """Per-subject class-1 probability.
+
+    Windows are pooled in *log space* first, then softmax once
+    (``softmax(mean_w logits)``). Averaging in probability space
+    (``mean_w softmax``) compresses every subject's score toward 0.5 when the
+    per-window CNN output varies, erasing discriminative signal.
+    """
+    logits_subj = logits.view(n_subjects, windows, -1).mean(dim=1)
+    return logits_subj.softmax(dim=1)[:, 1]
 
 
 def forward_batch(model: torch.nn.Module, x: torch.Tensor, y: torch.Tensor,
@@ -742,10 +748,7 @@ def main() -> None:
 
             if args.refit:
                 model, mean, std = refit_model(
-                    build_model(
-                        args.model, n_channels, n_classes=2, n_samples=n_samples,
-                        dropout=args.dropout, hidden=args.hidden, n_filters=args.n_filters,
-                    ).to(device),
+                    model,
                     train_loader, val_loader, args.refit_epochs, args.lr,
                     args.weight_decay, device, args.label_smoothing,
                     args.batch_size, args.loss,
