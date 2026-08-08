@@ -288,7 +288,7 @@ def train_fold(
             if consistency_coef > 0 and getattr(model, "full_subject_input", False):
                 n_subjects, windows = x.shape[0], x.shape[1]
                 subj_logits = logits.view(n_subjects, windows, -1).mean(dim=1)
-                y_subj = y.float() * 0.95 + 0.025
+                y_subj = (y.float() * 0.95 + 0.025).to(device)
                 tloss = tloss + consistency_coef * criterion(subj_logits[:, 1], y_subj)
             tloss.backward()
             optimizer.step()
@@ -423,7 +423,7 @@ def refit_model(
             if consistency_coef > 0 and getattr(model, "full_subject_input", False):
                 n_subjects, windows = xb.shape[0], xb.shape[1]
                 subj_logits = logits.view(n_subjects, windows, -1).mean(dim=1)
-                y_subj = yb.float() * 0.95 + 0.025
+                y_subj = (yb.float() * 0.95 + 0.025).to(device)
                 tloss = tloss + consistency_coef * criterion(subj_logits[:, 1], y_subj)
             tloss.backward()
             optimizer.step()
