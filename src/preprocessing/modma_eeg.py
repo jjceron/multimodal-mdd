@@ -67,7 +67,6 @@ class MODMADataset(Dataset):
 
         self.samples = []
         self._load_all()
-        self._equalize_windows()
 
     def _load_participants(self) -> pd.DataFrame:
         path = self.root / "participants.tsv"
@@ -111,14 +110,6 @@ class MODMADataset(Dataset):
                     "label": torch.tensor(rec["label"], dtype=torch.long),
                 }
             )
-
-    def _equalize_windows(self) -> None:
-        if not self.samples:
-            raise ValueError(f"No samples loaded from {self.root}")
-        min_windows = min(s["eeg"].shape[0] for s in self.samples)
-        for s in self.samples:
-            s["eeg"] = s["eeg"][:min_windows]
-        self.min_windows = min_windows
 
     def _process_edf(self, path: Path) -> np.ndarray | None:
         raw = mne.io.read_raw_edf(path.as_posix(), preload=True, verbose="ERROR")
@@ -186,7 +177,7 @@ def create_dataloaders(
     inner_split: int = 5,
     num_workers: int = 0,
     pin_memory: bool = False,
-) -> list[tuple[DataLoader, DataLoader, DataLoader]]:
+) -> list[tuple[list[tuple[DataLoader, DataLoader]], DataLoader, DataLoader]]:
     subjects, labels, eeg_data = [], [], []
 
     for s in dataset.samples:
@@ -194,17 +185,14 @@ def create_dataloaders(
         labels.append(int(s["label"].item()))
         eeg_data.append(s["eeg"])
 
-    class FoldDataset(Dataset):
-        def __init__(self, eeg_list, label_list, subject_indices):
-            self.X, self.y, self.names = [], [], []
-
-            for idx in subject_indices:
-                self.X.append(eeg_list[idx])
-                self.y.append(label_list[idx])
-                self.names.append(subjects[idx])
-
-            self.y = torch.tensor(self.y, dtype=torch.long)
-            self.X = torch.stack(self.X)
+    class SubjectDataset(Dataset):
+        def __init__(self, subject_indices, n_windows):
+            self.X = [eeg_data[idx][:n_windows] for idx in subject_indices]
+            self.y = torch.tensor(
+                [labels[idx] for idx in subject_indices],
+                dtype=torch.long,
+            )
+            self.names = [subjects[idx] for idx in subject_indices]
 
         def __len__(self):
             return len(self.names)
@@ -212,13 +200,36 @@ def create_dataloaders(
         def __getitem__(self, idx):
             return self.names[idx], self.X[idx], self.y[idx]
 
+    class WindowDataset(Dataset):
+        def __init__(self, subject_indices, n_windows):
+            self.index = []
+            self.y = []
+            self.names = []
+            for idx in subject_indices:
+                for window_index in range(n_windows):
+                    self.index.append((idx, window_index))
+                    self.y.append(labels[idx])
+                    self.names.append(subjects[idx])
+            self.y = torch.tensor(self.y, dtype=torch.long)
+
+        def __len__(self):
+            return len(self.names)
+
+        def __getitem__(self, idx):
+            subject_index, window_index = self.index[idx]
+            return (
+                self.names[idx],
+                eeg_data[subject_index][window_index],
+                self.y[idx],
+            )
+
     outer_gkf = StratifiedGroupKFold(
         n_splits=k_folder,
         shuffle=shuffle,
         random_state=split_seed,
     )
 
-    folds: list[tuple[DataLoader, DataLoader, DataLoader]] = []
+    folds: list[tuple[list[tuple[DataLoader, DataLoader]], DataLoader, DataLoader]] = []
 
     for train_val_idx, test_idx in outer_gkf.split(
         eeg_data,
@@ -231,46 +242,53 @@ def create_dataloaders(
             random_state=split_seed,
         )
 
-        train_idx, val_idx = next(
-            inner_gkf.split(
+        n_windows = min(
+            eeg_data[idx].shape[0]
+            for idx in train_val_idx
+        )
+
+        inner_folds = []
+        for train_idx, val_idx in inner_gkf.split(
                 [eeg_data[i] for i in train_val_idx],
                 [labels[i] for i in train_val_idx],
                 groups=[subjects[i] for i in train_val_idx],
-            )
-        )
+            ):
+            train_subjects = [train_val_idx[i] for i in train_idx]
+            val_subjects = [train_val_idx[i] for i in val_idx]
+            train_dataset = WindowDataset(train_subjects, n_windows)
+            val_dataset = WindowDataset(val_subjects, n_windows)
+            inner_folds.append((
+                DataLoader(train_dataset, batch_size=batch_size, shuffle=shuffle,
+                           num_workers=num_workers, pin_memory=pin_memory),
+                DataLoader(val_dataset, batch_size=batch_size, shuffle=False,
+                           num_workers=num_workers, pin_memory=pin_memory),
+            ))
 
-        train_subjects = [train_val_idx[i] for i in train_idx]
-        val_subjects = [train_val_idx[i] for i in val_idx]
+        outer_dataset = WindowDataset(train_val_idx, n_windows)
+        test_dataset = SubjectDataset(test_idx, n_windows)
 
-        train_dataset = FoldDataset(eeg_data, labels, train_subjects)
-        val_dataset = FoldDataset(eeg_data, labels, val_subjects)
-        test_dataset = FoldDataset(eeg_data, labels, test_idx)
+        outer_names = set(outer_dataset.names)
+        test_names = set(test_dataset.names)
+        if outer_names & test_names:
+            raise RuntimeError("Subject overlap detected between EEG folds")
 
-        train_loader = DataLoader(
-            train_dataset,
+        outer_loader = DataLoader(
+            outer_dataset,
             batch_size=batch_size,
             shuffle=shuffle,
             num_workers=num_workers,
             pin_memory=pin_memory,
         )
 
-        val_loader = DataLoader(
-            val_dataset,
-            batch_size=batch_size,
-            shuffle=False,
-            num_workers=num_workers,
-            pin_memory=pin_memory,
-        )
-
         test_loader = DataLoader(
             test_dataset,
-            batch_size=batch_size,
+            batch_size=1,
             shuffle=False,
             num_workers=num_workers,
             pin_memory=pin_memory,
         )
 
-        folds.append((train_loader, val_loader, test_loader))
+        folds.append((inner_folds, outer_loader, test_loader))
 
     return folds
 
@@ -297,6 +315,7 @@ def parse_args():
 
 def main():
     args = parse_args()
+
     ds = MODMADataset(
         root=args.root,
         channels=args.channels,
@@ -309,51 +328,232 @@ def main():
         reference=args.reference,
     )
 
-    n_windows = sum(s["eeg"].shape[0] for s in ds.samples)
-    counts = Counter(int(s["label"]) for s in ds.samples)
-    n_hc = counts.get(0, 0)
-    n_mdd = counts.get(1, 0)
-    split_seed = args.split_seed
+    subject_ids = sorted(
+        sample["participant_id"]
+        for sample in ds.samples
+    )
 
-    line = "=" * 60
-    print(line)
-    print(" MODMA EEG - dataset & nested-CV summary")
-    print("-" * 60)
-    print(f" Dataset : {len(ds)} subjects | {len(ds.channel_names)} channels ({args.channels})")
-    print(f" Labels  : HC={n_hc} ({100 * n_hc / len(ds):.1f}%) | MDD={n_mdd} ({100 * n_mdd / len(ds):.1f}%)")
-    print(f" Windows : {n_windows} total | per-subject shape {tuple(ds.samples[0]['eeg'].shape)}")
-    print(f" CV      : (SGKF) | outer k={args.k} | inner k={args.inner_splits} | split_seed={split_seed}")
-    print(line)
+    subject_alias = {
+        subject_id: f"S{index:02d}"
+        for index, subject_id in enumerate(subject_ids, start=1)
+    }
+
+    label_by_subject = {
+        sample["participant_id"]: int(sample["label"].item())
+        for sample in ds.samples
+    }
+
+    windows_per_subject = [
+        sample["eeg"].shape[0]
+        for sample in ds.samples
+    ]
+
+    n_windows_total = sum(windows_per_subject)
+    n_windows_min = min(windows_per_subject)
+    n_windows_max = max(windows_per_subject)
+    n_windows_mean = np.mean(windows_per_subject)
+
+    counts = Counter(label_by_subject.values())
+
+    print("=" * 88)
+    print(" MODMA EEG - dataset and nested-CV summary")
+    print("=" * 88)
+    print(
+        f" Dataset       : {len(ds)} subjects | "
+        f"{len(ds.channel_names)} channels ({args.channels})"
+    )
+    print(
+        f" Labels        : HC={counts.get(0, 0)} "
+        f"({100 * counts.get(0, 0) / len(ds):.1f}%) | "
+        f"MDD={counts.get(1, 0)} "
+        f"({100 * counts.get(1, 0) / len(ds):.1f}%)"
+    )
+    print(
+        f" Windows       : total={n_windows_total} | "
+        f"min={n_windows_min} | max={n_windows_max} | "
+        f"mean={n_windows_mean:.2f}"
+    )
+    print(
+        f" Representation : [{n_windows_min}, "
+        f"{len(ds.channel_names)}, "
+        f"{ds.samples[0]['eeg'].shape[-1]}]"
+    )
+    print(
+        f" CV            : SGKF | outer={args.k} | "
+        f"inner={args.inner_splits} | seed={args.split_seed}"
+    )
+    print("=" * 88)
 
     folds = create_dataloaders(
         ds,
         k_folder=args.k,
         batch_size=args.batch_size,
         inner_split=args.inner_splits,
-        split_seed=split_seed,
+        split_seed=args.split_seed,
     )
 
-    def counts_str(dl):
-        c = Counter(dl.dataset.y.tolist())
-        return f"{c.get(0, 0)} / {c.get(1, 0)}"
+    def unique_subjects(loader):
+        return sorted(set(loader.dataset.names))
 
-    print(f"{'Fold':<6} {'Train':<9} {'HC/MDD':<13} {'Val':<8} {'HC/MDD':<12} {'Test':<9} {'HC/MDD':<10}")
-    print(f"{'-'*6} {'-'*9} {'-'*13} {'-'*8} {'-'*12} {'-'*9} {'-'*10}")
-    for i, (tr, va, te) in enumerate(folds):
-        print(
-            f"{i:<6} {len(tr.dataset):<9} {counts_str(tr):<13} "
-            f"{len(va.dataset):<8} {counts_str(va):<12} "
-            f"{len(te.dataset):<9} {counts_str(te):<10}"
+    def subject_counts(names):
+        labels = [
+            label_by_subject[name]
+            for name in names
+        ]
+        return (
+            f"HC={labels.count(0)}, "
+            f"MDD={labels.count(1)}"
         )
 
-    if args.show_subjects:
-        print()
-        print(" Subject IDs per fold (sorted)")
-        for i, (tr, va, te) in enumerate(folds):
-            print(f" Fold {i}  tr=[{' '.join(sorted(tr.dataset.names))}]")
-            print(f"           va=[{' '.join(sorted(va.dataset.names))}]")
-            print(f"           te=[{' '.join(sorted(te.dataset.names))}]")
+    print()
+    print(" OUTER FOLD SUMMARY")
+    print("-" * 88)
+    print(
+        f"{'Fold':<8}"
+        f"{'Train subjects':<18}"
+        f"{'Train labels':<22}"
+        f"{'Inner folds':<14}"
+        f"{'Test subjects':<18}"
+        f"{'Test labels':<20}"
+    )
+    print("-" * 88)
 
+    fold_details = []
+
+    for fold_index, (
+        inner_folds,
+        outer_loader,
+        test_loader,
+    ) in enumerate(folds, start=1):
+        outer_train_subjects = unique_subjects(outer_loader)
+        test_subjects = unique_subjects(test_loader)
+
+        train_set = set(outer_train_subjects)
+        test_set = set(test_subjects)
+
+        if train_set & test_set:
+            raise RuntimeError(
+                f"Leakage in outer fold {fold_index}"
+            )
+
+        print(
+            f"{fold_index:<8}"
+            f"{len(outer_train_subjects):<18}"
+            f"{subject_counts(outer_train_subjects):<22}"
+            f"{len(inner_folds):<14}"
+            f"{len(test_subjects):<18}"
+            f"{subject_counts(test_subjects):<20}"
+        )
+
+        fold_details.append(
+            (
+                fold_index,
+                inner_folds,
+                outer_train_subjects,
+                test_subjects,
+            )
+        )
+
+    print("-" * 88)
+
+    print()
+    print(" SUBJECT ASSIGNMENT BY FOLD")
+    print("-" * 88)
+
+    for (
+        fold_index,
+        inner_folds,
+        outer_train_subjects,
+        test_subjects,
+    ) in fold_details:
+        print()
+        print(f"OUTER FOLD {fold_index}")
+        print("-" * 88)
+
+        print(
+            "Outer train+validation: "
+            + " ".join(
+                subject_alias[name]
+                for name in outer_train_subjects
+            )
+        )
+
+        print(
+            "Outer test:             "
+            + " ".join(
+                subject_alias[name]
+                for name in test_subjects
+            )
+        )
+
+        print()
+        print("INNER FOLDS")
+
+        for inner_index, (
+            inner_train_loader,
+            inner_val_loader,
+        ) in enumerate(inner_folds, start=1):
+            inner_train_subjects = unique_subjects(
+                inner_train_loader
+            )
+            inner_val_subjects = unique_subjects(
+                inner_val_loader
+            )
+
+            inner_train_set = set(inner_train_subjects)
+            inner_val_set = set(inner_val_subjects)
+
+            if inner_train_set & inner_val_set:
+                raise RuntimeError(
+                    f"Leakage in outer fold {fold_index}, "
+                    f"inner fold {inner_index}"
+                )
+
+            if inner_train_set & set(test_subjects):
+                raise RuntimeError(
+                    f"Outer test leakage in outer fold {fold_index}, "
+                    f"inner fold {inner_index}"
+                )
+
+            if inner_val_set & set(test_subjects):
+                raise RuntimeError(
+                    f"Outer test leakage in outer fold {fold_index}, "
+                    f"inner fold {inner_index}"
+                )
+
+            print()
+            print(f"Inner fold {inner_index}")
+            print(
+                "  train: "
+                + " ".join(
+                    subject_alias[name]
+                    for name in inner_train_subjects
+                )
+            )
+            print(
+                "  val:   "
+                + " ".join(
+                    subject_alias[name]
+                    for name in inner_val_subjects
+                )
+            )
+            print(
+                f"  counts: train={len(inner_train_subjects)} "
+                f"({subject_counts(inner_train_subjects)}), "
+                f"val={len(inner_val_subjects)} "
+                f"({subject_counts(inner_val_subjects)})"
+            )
+
+    print()
+    print(" SUBJECT ALIAS TABLE")
+    print("-" * 40)
+
+    for subject_id in subject_ids:
+        print(
+            f"{subject_alias[subject_id]} -> "
+            f"{subject_id} "
+            f"({('MDD' if label_by_subject[subject_id] else 'HC')})"
+        )
 
 if __name__ == "__main__":
     main()
