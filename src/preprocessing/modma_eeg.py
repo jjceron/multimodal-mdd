@@ -544,16 +544,5 @@ def main():
                 f"({subject_counts(inner_val_subjects)})"
             )
 
-    print()
-    print(" SUBJECT ALIAS TABLE")
-    print("-" * 40)
-
-    for subject_id in subject_ids:
-        print(
-            f"{subject_alias[subject_id]} -> "
-            f"{subject_id} "
-            f"({('MDD' if label_by_subject[subject_id] else 'HC')})"
-        )
-
 if __name__ == "__main__":
     main()
