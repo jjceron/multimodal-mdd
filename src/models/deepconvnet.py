@@ -30,9 +30,13 @@ def _block(
     dropout: float,
     first: bool = False,
 ) -> nn.Sequential:
-    layers = [nn.Conv2d(in_channels, out_channels, (1, 10), padding="same")]
+    layers = [nn.Conv2d(in_channels, out_channels, (1, 10))]
     if first:
-        layers.append(nn.Conv2d(out_channels, out_channels, (n_channels, 1)))
+        layers.append(nn.BatchNorm2d(out_channels))
+        layers.append(nn.ELU())
+        layers.append(nn.MaxPool2d(pool))
+        layers.append(nn.Dropout2d(dropout))
+        return nn.Sequential(*layers)
     layers += [
         nn.BatchNorm2d(out_channels),
         nn.ELU(),
@@ -52,10 +56,28 @@ class DeepConvNet(nn.Module):
     ) -> None:
         super().__init__()
 
-        self.block1 = _block(1, 4, n_channels, (1, 4), dropout, first=True)
-        self.block2 = _block(4, 8, n_channels, (1, 4), dropout)
-        self.block3 = _block(8, 16, n_channels, (1, 2), dropout)
-        self.block4 = _block(16, 64, n_channels, (1, 2), dropout)
+        self.block1 = _block(1, 4, n_channels, (1, 3), dropout, first=True)
+        self.block2 = nn.Sequential(
+            nn.Conv2d(4, 8, (n_channels, 1)),
+            nn.BatchNorm2d(8),
+            nn.ELU(),
+            nn.MaxPool2d((1, 3)),
+            nn.Dropout2d(dropout),
+        )
+        self.block3 = nn.Sequential(
+            nn.Conv2d(8, 16, (1, 10)),
+            nn.BatchNorm2d(16),
+            nn.ELU(),
+            nn.MaxPool2d((1, 3)),
+            nn.Dropout2d(dropout),
+        )
+        self.block4 = nn.Sequential(
+            nn.Conv2d(16, 64, (1, 10)),
+            nn.BatchNorm2d(64),
+            nn.ELU(),
+            nn.MaxPool2d((1, 3)),
+            nn.Dropout2d(dropout),
+        )
 
         dummy = torch.randn(1, 1, n_channels, n_samples)
         with torch.no_grad():
