@@ -13,7 +13,6 @@ from sklearn.metrics import roc_auc_score
 
 from src.models.deepconvnet import DeepConvNet
 from src.models.shallowconvnet import ShallowConvNet
-from src.preprocessing.modma_eeg import create_dataloaders
 from src.utils.get_seed import set_seed
 from src.utils.training_logger import ClassificationLogger
 
@@ -259,6 +258,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--patience", type=int, default=25)
     parser.add_argument("--tag", type=str, default="v1")
     parser.add_argument("--output-root", type=str, default=None)
+    parser.add_argument("--save-model", action="store_true", help="Save the final model per-fold model checkpoint '.pt'")
+
     return parser.parse_args()
 
 
@@ -308,7 +309,14 @@ def main() -> None:
     )
 
     for split_seed in args.split_seed:
-        folds = create_dataloaders(
+        if args.modal == "aud":
+            from src.preprocessing.modma_aud import create_audio_dataloaders
+            loader_fn = create_audio_dataloaders
+        else:
+            from src.preprocessing.modma_eeg import create_dataloaders
+            loader_fn = create_dataloaders
+
+        folds = loader_fn(
             dataset, k_folder=args.k, inner_split=args.inner_splits,
             split_seed=split_seed, batch_size=args.batch_size,
             num_workers=NUM_WORKERS, pin_memory=device == "cuda",
@@ -389,6 +397,13 @@ def main() -> None:
 
             logger.log_fold_test(fres["test_true"], fres["test_pred"], fres["test_auc"])
             write_results()
+            
+            if args.save_model:
+                torch.save(model.state_dict(), out_dir / f"fold_{fold_index}.pt")
+                torch.save(
+                    {"mean": mean.cpu(), "std": std.cpu()},
+                    out_dir / f"fold_{fold_index}_stats.pt",
+                )
 
             del model
             torch.cuda.empty_cache()
