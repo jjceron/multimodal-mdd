@@ -10,7 +10,7 @@ import mne
 import numpy as np
 import pandas as pd
 import torch
-from sklearn.model_selection import StratifiedGroupKFold
+from sklearn.model_selection import StratifiedGroupKFold, StratifiedShuffleSplit
 from torch.utils.data import DataLoader, Dataset
 
 from src.preprocessing.channel_selection import (
@@ -174,10 +174,10 @@ def create_dataloaders(
     batch_size: int = 16,
     shuffle: bool = True,
     split_seed: int = 42,
-    inner_split: int = 5,
+    val_ratio: float = 0.2,
     num_workers: int = 0,
     pin_memory: bool = False,
-) -> list[tuple[list[tuple[DataLoader, DataLoader]], DataLoader, DataLoader]]:
+) -> list[tuple[DataLoader, DataLoader, DataLoader]]:
     subjects, labels, eeg_data = [], [], []
 
     for s in dataset.samples:
@@ -229,49 +229,46 @@ def create_dataloaders(
         random_state=split_seed,
     )
 
-    folds: list[tuple[list[tuple[DataLoader, DataLoader]], DataLoader, DataLoader]] = []
+    folds: list[tuple[DataLoader, DataLoader, DataLoader]] = []
 
     for train_val_idx, test_idx in outer_gkf.split(
         eeg_data,
         labels,
         groups=subjects,
     ):
-        inner_gkf = StratifiedGroupKFold(
-            n_splits=inner_split,
-            shuffle=shuffle,
-            random_state=split_seed,
+        n_windows = min(eeg_data[idx].shape[0] for idx in train_val_idx)
+
+        sss = StratifiedShuffleSplit(
+            n_splits=1, test_size=val_ratio, random_state=split_seed
         )
-
-        n_windows = min(
-            eeg_data[idx].shape[0]
-            for idx in train_val_idx
-        )
-
-        inner_folds = []
-        for train_idx, val_idx in inner_gkf.split(
-                [eeg_data[i] for i in train_val_idx],
-                [labels[i] for i in train_val_idx],
-                groups=[subjects[i] for i in train_val_idx],
-            ):
-            train_subjects = [train_val_idx[i] for i in train_idx]
-            val_subjects = [train_val_idx[i] for i in val_idx]
-            train_dataset = WindowDataset(train_subjects, n_windows)
-            val_dataset = WindowDataset(val_subjects, n_windows)
-            inner_folds.append((
-                DataLoader(train_dataset, batch_size=batch_size, shuffle=shuffle,
-                           num_workers=num_workers, pin_memory=pin_memory),
-                DataLoader(val_dataset, batch_size=batch_size, shuffle=False,
-                           num_workers=num_workers, pin_memory=pin_memory),
-            ))
-
+        val_labels = [labels[i] for i in train_val_idx]
+        train_idx, val_idx = next(sss.split(np.zeros(len(train_val_idx)), val_labels))
+        train_subjects = [train_val_idx[i] for i in train_idx]
+        val_subjects = [train_val_idx[i] for i in val_idx]
+        train_dataset = WindowDataset(train_subjects, n_windows)
+        val_dataset = WindowDataset(val_subjects, n_windows)
         outer_dataset = WindowDataset(train_val_idx, n_windows)
         test_dataset = SubjectDataset(test_idx, n_windows)
 
-        outer_names = set(outer_dataset.names)
+        train_val_names = set(train_dataset.names) | set(val_dataset.names)
         test_names = set(test_dataset.names)
-        if outer_names & test_names:
+        if train_val_names & test_names:
             raise RuntimeError("Subject overlap detected between EEG folds")
 
+        train_loader = DataLoader(
+            train_dataset,
+            batch_size=batch_size,
+            shuffle=shuffle,
+            num_workers=num_workers,
+            pin_memory=pin_memory,
+        )
+        val_loader = DataLoader(
+            val_dataset,
+            batch_size=batch_size,
+            shuffle=False,
+            num_workers=num_workers,
+            pin_memory=pin_memory,
+        )
         outer_loader = DataLoader(
             outer_dataset,
             batch_size=batch_size,
@@ -279,7 +276,6 @@ def create_dataloaders(
             num_workers=num_workers,
             pin_memory=pin_memory,
         )
-
         test_loader = DataLoader(
             test_dataset,
             batch_size=1,
@@ -288,7 +284,7 @@ def create_dataloaders(
             pin_memory=pin_memory,
         )
 
-        folds.append((inner_folds, outer_loader, test_loader))
+        folds.append((train_loader, val_loader, outer_loader, test_loader))
 
     return folds
 
@@ -298,7 +294,7 @@ def parse_args():
     parser.add_argument("--root", type=str, default=str(EEG_DIR))
     parser.add_argument("--channels", type=str, default="f64")
     parser.add_argument("--k", type=int, default=5)
-    parser.add_argument("--inner-splits", type=int, default=5)
+    parser.add_argument("--val-ratio", type=float, default=0.2)
     parser.add_argument("--batch-size", type=int, default=16)
     parser.add_argument("--lowcut", type=float, default=0.5)
     parser.add_argument("--highcut", type=float, default=50.0)
@@ -306,8 +302,9 @@ def parse_args():
     parser.add_argument("--target-fs", type=float, default=None)
     parser.add_argument("--window-sec", type=float, default=2.0)
     parser.add_argument("--overlap", type=float, default=0.5)
-    parser.add_argument("--reference", type=str, default="average",
-                        choices=["average", "cz"])
+    parser.add_argument(
+        "--reference", type=str, default="average", choices=["average", "cz"]
+    )
     parser.add_argument("--split-seed", type=int, default=2509)
     parser.add_argument("--show-subjects", action="store_true")
     return parser.parse_args()
@@ -328,10 +325,7 @@ def main():
         reference=args.reference,
     )
 
-    subject_ids = sorted(
-        sample["participant_id"]
-        for sample in ds.samples
-    )
+    subject_ids = sorted(sample["participant_id"] for sample in ds.samples)
 
     subject_alias = {
         subject_id: f"S{index:02d}"
@@ -339,14 +333,10 @@ def main():
     }
 
     label_by_subject = {
-        sample["participant_id"]: int(sample["label"].item())
-        for sample in ds.samples
+        sample["participant_id"]: int(sample["label"].item()) for sample in ds.samples
     }
 
-    windows_per_subject = [
-        sample["eeg"].shape[0]
-        for sample in ds.samples
-    ]
+    windows_per_subject = [sample["eeg"].shape[0] for sample in ds.samples]
 
     n_windows_total = sum(windows_per_subject)
     n_windows_min = min(windows_per_subject)
@@ -380,7 +370,7 @@ def main():
     )
     print(
         f" CV            : SGKF | outer={args.k} | "
-        f"inner={args.inner_splits} | seed={args.split_seed}"
+        f"val_ratio={args.val_ratio} | seed={args.split_seed}"
     )
     print("=" * 88)
 
@@ -388,7 +378,7 @@ def main():
         ds,
         k_folder=args.k,
         batch_size=args.batch_size,
-        inner_split=args.inner_splits,
+        val_ratio=args.val_ratio,
         split_seed=args.split_seed,
     )
 
@@ -396,14 +386,8 @@ def main():
         return sorted(set(loader.dataset.names))
 
     def subject_counts(names):
-        labels = [
-            label_by_subject[name]
-            for name in names
-        ]
-        return (
-            f"HC={labels.count(0)}, "
-            f"MDD={labels.count(1)}"
-        )
+        labels = [label_by_subject[name] for name in names]
+        return f"HC={labels.count(0)}, MDD={labels.count(1)}"
 
     print()
     print(" OUTER FOLD SUMMARY")
@@ -412,7 +396,7 @@ def main():
         f"{'Fold':<8}"
         f"{'Train subjects':<18}"
         f"{'Train labels':<22}"
-        f"{'Inner folds':<14}"
+        f"{'Val subjects':<14}"
         f"{'Test subjects':<18}"
         f"{'Test labels':<20}"
     )
@@ -421,26 +405,33 @@ def main():
     fold_details = []
 
     for fold_index, (
-        inner_folds,
+        train_loader,
+        val_loader,
         outer_loader,
         test_loader,
     ) in enumerate(folds, start=1):
-        outer_train_subjects = unique_subjects(outer_loader)
+        train_subjects = unique_subjects(train_loader)
+        val_subjects = unique_subjects(val_loader)
+        outer_subjects = unique_subjects(outer_loader)
+        train_val_subjects = sorted(set(train_subjects) | set(val_subjects))
         test_subjects = unique_subjects(test_loader)
 
-        train_set = set(outer_train_subjects)
-        test_set = set(test_subjects)
-
-        if train_set & test_set:
-            raise RuntimeError(
-                f"Leakage in outer fold {fold_index}"
-            )
+        if set(outer_subjects) != set(train_val_subjects):
+            raise RuntimeError(f"Outer != train∪val in outer fold {fold_index}")
+        if set(train_subjects) & set(val_subjects):
+            raise RuntimeError(f"Train/val leakage in outer fold {fold_index}")
+        if set(train_subjects) & set(test_subjects):
+            raise RuntimeError(f"Train/test leakage in outer fold {fold_index}")
+        if set(val_subjects) & set(test_subjects):
+            raise RuntimeError(f"Val/test leakage in outer fold {fold_index}")
+        if set(test_subjects) & set(train_val_subjects):
+            raise RuntimeError(f"Val/test leakage in outer fold {fold_index}")
 
         print(
             f"{fold_index:<8}"
-            f"{len(outer_train_subjects):<18}"
-            f"{subject_counts(outer_train_subjects):<22}"
-            f"{len(inner_folds):<14}"
+            f"{len(train_subjects):<18}"
+            f"{subject_counts(train_subjects):<22}"
+            f"{len(val_subjects):<14}"
             f"{len(test_subjects):<18}"
             f"{subject_counts(test_subjects):<20}"
         )
@@ -448,8 +439,9 @@ def main():
         fold_details.append(
             (
                 fold_index,
-                inner_folds,
-                outer_train_subjects,
+                train_subjects,
+                val_subjects,
+                train_val_subjects,
                 test_subjects,
             )
         )
@@ -462,87 +454,19 @@ def main():
 
     for (
         fold_index,
-        inner_folds,
-        outer_train_subjects,
+        train_subjects,
+        val_subjects,
+        _train_val_subjects,
         test_subjects,
     ) in fold_details:
         print()
         print(f"OUTER FOLD {fold_index}")
         print("-" * 88)
 
-        print(
-            "Outer train+validation: "
-            + " ".join(
-                subject_alias[name]
-                for name in outer_train_subjects
-            )
-        )
+        print("Train: " + " ".join(subject_alias[name] for name in train_subjects))
+        print("Val:   " + " ".join(subject_alias[name] for name in val_subjects))
+        print("Test:  " + " ".join(subject_alias[name] for name in test_subjects))
 
-        print(
-            "Outer test:             "
-            + " ".join(
-                subject_alias[name]
-                for name in test_subjects
-            )
-        )
-
-        print()
-        print("INNER FOLDS")
-
-        for inner_index, (
-            inner_train_loader,
-            inner_val_loader,
-        ) in enumerate(inner_folds, start=1):
-            inner_train_subjects = unique_subjects(
-                inner_train_loader
-            )
-            inner_val_subjects = unique_subjects(
-                inner_val_loader
-            )
-
-            inner_train_set = set(inner_train_subjects)
-            inner_val_set = set(inner_val_subjects)
-
-            if inner_train_set & inner_val_set:
-                raise RuntimeError(
-                    f"Leakage in outer fold {fold_index}, "
-                    f"inner fold {inner_index}"
-                )
-
-            if inner_train_set & set(test_subjects):
-                raise RuntimeError(
-                    f"Outer test leakage in outer fold {fold_index}, "
-                    f"inner fold {inner_index}"
-                )
-
-            if inner_val_set & set(test_subjects):
-                raise RuntimeError(
-                    f"Outer test leakage in outer fold {fold_index}, "
-                    f"inner fold {inner_index}"
-                )
-
-            print()
-            print(f"Inner fold {inner_index}")
-            print(
-                "  train: "
-                + " ".join(
-                    subject_alias[name]
-                    for name in inner_train_subjects
-                )
-            )
-            print(
-                "  val:   "
-                + " ".join(
-                    subject_alias[name]
-                    for name in inner_val_subjects
-                )
-            )
-            print(
-                f"  counts: train={len(inner_train_subjects)} "
-                f"({subject_counts(inner_train_subjects)}), "
-                f"val={len(inner_val_subjects)} "
-                f"({subject_counts(inner_val_subjects)})"
-            )
 
 if __name__ == "__main__":
     main()
