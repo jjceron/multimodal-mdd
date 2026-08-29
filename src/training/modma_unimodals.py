@@ -325,7 +325,7 @@ def main() -> None:
               f"subjects={len(dataset.samples)} n_ch={n_channels} n_samples={n_samples}")
         print(f" device={device} gpu={gpu} params(total={total}, trainable={trainable})")
         print("=" * 70)
-
+ 
         logger = ClassificationLogger()
         fold_results: dict[str, dict] = {}
         results = {
