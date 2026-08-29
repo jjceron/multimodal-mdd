@@ -334,7 +334,6 @@ def main() -> None:
                 "timestamp": datetime.now(UTC).isoformat(),
                 "git_commit": _git_commit(),
                 "windows": windows,
-                "tag": args.tag,
                 "cli": vars(args),
             },
             "test": {},
