@@ -295,8 +295,8 @@ def main() -> None:
 
     windows = (
         int(min(s["eeg"].shape[0] for s in dataset.samples))
-        if args.modal == "eeg" 
-        else int(dataset.min_windows)
+        if args.modal == "eeg"
+        else None  # audio: variable window count per subject
     )
     n_classes = 1 
 
