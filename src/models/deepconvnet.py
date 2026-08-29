@@ -1,19 +1,4 @@
 """DeepConvNet (Schirrmeister et al., 2017) adapted for MODMA EEG.
-
-This is a hybrid: it keeps the capacity of the historically best-performing
-configuration on this dataset (block filters 4/8/16/64, which reached BACC
-0.602 on seed 42) while incorporating the structural fixes proven by the
-paper-faithful rework:
-
-  * ``padding="same"`` on every temporal convolution, so temporal resolution is
-    preserved until pooling (the old model collapsed the time axis too early).
-  * the channel-wise (spatial) convolution lives inside block1, right after the
-    first temporal convolution, matching the original paper layout.
-  * final max-pools of 2 instead of 3 so a 2 s @ 250 Hz window (500 samples)
-    is pooled to 7 temporal steps instead of collapsing to ~1 step.
-
-``fc_features`` is derived from a dummy forward pass, so the model adapts to
-any ``n_samples`` (e.g. 1000 for 4 s windows) with no extra parameters.
 """
 
 from __future__ import annotations

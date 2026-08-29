@@ -7,8 +7,6 @@ import torch
 import torch.nn as nn
 from torch import Tensor
 
-from .sinc_conv import SincConv2d
-
 
 class ShallowConvNet(nn.Module):
     def __init__(
@@ -17,7 +15,6 @@ class ShallowConvNet(nn.Module):
         n_classes: int = 2,
         n_samples: int = 256,
         dropout: float = 0.5,
-        sinc: bool = False,
     ) -> None:
         super().__init__()
 
@@ -26,22 +23,14 @@ class ShallowConvNet(nn.Module):
         stride = (1, 11)
         kern = 13
 
-        if sinc:
-            self.temporal_conv = SincConv2d(
-                in_channels=1,
-                out_channels=8,
-                kernel_size=(1, kern),
-                sample_rate=250,
-                padding="same",
-            )
-        else:
-            self.temporal_conv = nn.Conv2d(
-                in_channels=1,
-                out_channels=8,
-                kernel_size=(1, kern),
-                padding="same",
-                bias=True,
-            )
+        self.temporal_conv = nn.Conv2d(
+            in_channels=1,
+            out_channels=8,
+            kernel_size=(1, kern),
+            padding="same",
+            bias=True,
+        )
+
         self.spatial_conv = nn.Conv2d(
             in_channels=8,
             out_channels=8,

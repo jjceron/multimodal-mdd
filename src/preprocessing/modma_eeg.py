@@ -39,9 +39,9 @@ class MODMADataset(Dataset):
     def __init__(
         self,
         root: str | Path = EEG_DIR,
-        channels: str = "all",
+        channels: str = "f64",
         lowcut: float | None = 0.5,
-        highcut: float | None = 60.0,
+        highcut: float | None = 50.0,
         notch: float | None = 50.0,
         target_fs: float | None = None,
         window_sec: float = 2.0,
@@ -296,7 +296,7 @@ def create_dataloaders(
 def parse_args():
     parser = argparse.ArgumentParser()
     parser.add_argument("--root", type=str, default=str(EEG_DIR))
-    parser.add_argument("--channels", type=str, default="10-20")
+    parser.add_argument("--channels", type=str, default="f64")
     parser.add_argument("--k", type=int, default=5)
     parser.add_argument("--inner-splits", type=int, default=5)
     parser.add_argument("--batch-size", type=int, default=16)

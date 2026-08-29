@@ -4,7 +4,7 @@ import argparse
 import json
 import platform
 import subprocess
-from datetime import datetime
+from datetime import UTC, datetime
 from pathlib import Path
 
 import numpy as np
@@ -46,28 +46,20 @@ def normalize_channels(x, mean, std):
     return (x - mean.view(shape)) / (std.view(shape) + 1e-8)
 
 
-def make_criterion(loss, device, label_smoothing, train_loader=None,
-                   bce_pos_weight=True, pos_weight_override=None):
-    if loss == "bce":
-        pos_weight = None
-        if pos_weight_override is not None:
-            pos_weight = torch.tensor(float(pos_weight_override), dtype=torch.float32).to(device)
-        elif bce_pos_weight and train_loader is not None:
-            counts = torch.bincount(torch.cat([y for _, _, y in train_loader]).long())
-            if counts.numel() > 1 and float(counts[1]) > 0:
-                pos_weight = (counts[0].float() / counts[1].float()).to(device)
-        return torch.nn.BCEWithLogitsLoss(pos_weight=pos_weight)
-    counts = torch.bincount(torch.cat([y for _, _, y in train_loader]).long())
-    cls_weights = (1.0 / counts.float()).to(device)
-    cls_weights = cls_weights / cls_weights.mean()
-    return torch.nn.CrossEntropyLoss(weight=cls_weights, label_smoothing=label_smoothing)
+def make_criterion(device, train_loader=None, pos_weight=None):
+    pw = None
+    if pos_weight is not None:
+        pw = torch.tensor(float(pos_weight), dtype=torch.float32).to(device)
+    elif train_loader is not None:
+        counts = torch.bincount(torch.cat([y for _, _, y in train_loader]).long())
+        if counts.numel() > 1 and float(counts[1]) > 0:
+            pw = (counts[0].float() / counts[1].float()).to(device)
+    return torch.nn.BCEWithLogitsLoss(pos_weight=pw)
 
 
-def step_loss(criterion, logits, yf, loss):
-    if loss == "bce":
-        smoothed = yf.float() * 0.95 + 0.025
-        return criterion(logits.squeeze(-1), smoothed)
-    return criterion(logits, yf.long())
+def step_loss(criterion, logits, yf):
+    smoothed = yf.float() * 0.95 + 0.025
+    return criterion(logits.squeeze(-1), smoothed)
 
 
 def expand_labels(y, windows):
@@ -116,10 +108,9 @@ def confusion_matrix(true, pred):
 
 
 def train_fold(model, train_loader, val_loader, epochs, lr, weight_decay,
-               patience, device, logger, mean, std, label_smoothing, loss,
-               bce_pos_weight=True, pos_weight_override=None, early_stop_on="window-bacc"):
-    criterion = make_criterion(loss, device, label_smoothing, train_loader=train_loader,
-                               bce_pos_weight=bce_pos_weight, pos_weight_override=pos_weight_override)
+               patience, device, logger, mean, std, pos_weight=None, early_stop_on="subject-bacc"):
+    
+    criterion = make_criterion(device, train_loader=train_loader, pos_weight=pos_weight)
     optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=weight_decay)
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode="max", factor=0.5, patience=10)
 
@@ -132,7 +123,7 @@ def train_fold(model, train_loader, val_loader, epochs, lr, weight_decay,
         for name, xb, yb in train_loader:
             logits, yf = forward_batch(model, xb, yb, mean, std, device)
             optimizer.zero_grad()
-            tloss = step_loss(criterion, logits, yf, loss)
+            tloss = step_loss(criterion, logits, yf)
             tloss.backward()
             optimizer.step()
             tr_loss += tloss.item() * len(yf)
@@ -146,7 +137,7 @@ def train_fold(model, train_loader, val_loader, epochs, lr, weight_decay,
         with torch.no_grad():
             for name, xb, yb in val_loader:
                 logits, yf = forward_batch(model, xb, yb, mean, std, device)
-                val_loss += step_loss(criterion, logits, yf, loss).item() * len(yf)
+                val_loss += step_loss(criterion, logits, yf).item() * len(yf)
                 val_true.extend(yf.cpu().tolist())
                 val_pred.extend(binary_predictions(logits).cpu().tolist())
                 lgts = logits.squeeze(-1).cpu().tolist()
@@ -179,17 +170,16 @@ def train_fold(model, train_loader, val_loader, epochs, lr, weight_decay,
 
 
 def train_fixed_epochs(model, train_loader, epochs, lr, weight_decay, device,
-                       mean, std, label_smoothing, loss, bce_pos_weight=True,
-                       pos_weight_override=None):
-    criterion = make_criterion(loss, device, label_smoothing, train_loader=train_loader,
-                               bce_pos_weight=bce_pos_weight, pos_weight_override=pos_weight_override)
+                       mean, std, pos_weight=None):
+    
+    criterion = make_criterion(device, train_loader=train_loader, pos_weight=pos_weight)
     optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=weight_decay)
     model.train()
     for _ in range(max(epochs, 1)):
         for name, xb, yb in train_loader:
             logits, yf = forward_batch(model, xb, yb, mean, std, device)
             optimizer.zero_grad()
-            step_loss(criterion, logits, yf, loss).backward()
+            step_loss(criterion, logits, yf).backward()
             optimizer.step()
     return model
 
@@ -243,7 +233,7 @@ def _load_dataset(args) -> tuple[object, int, int]:
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Unimodal MODMA classification (EEG deepconvnet / audio shallowconvnet)")
+    parser = argparse.ArgumentParser(description="Unimodal classification for EEG and Audio MODMA modalities")
     parser.add_argument("--modal", type=str, default="eeg", choices=["eeg", "aud"])
     parser.add_argument("--model", type=str, default="deepconvnet", choices=sorted(MODEL_CLASSES))
     parser.add_argument("--channels", type=str, default="f64", choices=["all", "10-20", "f64", "29"])
@@ -254,9 +244,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--reference", type=str, default="average", choices=["average", "cz"])
     parser.add_argument("--overlap", type=float, default=0.5)
     parser.add_argument("--window-sec", type=float, default=2.0)
-    parser.add_argument("--loss", type=str, default="bce", choices=["bce", "ce"])
-    parser.add_argument("--early-stop-on", type=str, default="window-bacc", choices=["window-bacc", "subject-bacc"])
-    parser.add_argument("--no-bce-pos-weight", action="store_true")
+    parser.add_argument("--early-stop-on", type=str, default="subject-bacc", choices=["window-bacc", "subject-bacc"])
     parser.add_argument("--pos-weight", type=float, default=None,
                         help="Override BCE pos_weight (None = auto class-balanced)")
     parser.add_argument("--k", type=int, default=5)
@@ -268,9 +256,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--lr", type=float, default=5e-4)
     parser.add_argument("--weight-decay", type=float, default=5e-3)
     parser.add_argument("--dropout", type=float, default=0.5)
-    parser.add_argument("--label-smoothing", type=float, default=0.05)
-    parser.add_argument("--patience", type=int, default=40)
-    parser.add_argument("--max-windows", type=int, default=200)
+    parser.add_argument("--patience", type=int, default=25)
     parser.add_argument("--tag", type=str, default="v1")
     parser.add_argument("--output-root", type=str, default=None)
     return parser.parse_args()
@@ -281,19 +267,19 @@ def _git_commit() -> str:
         out = subprocess.run(["git", "rev-parse", "--short", "HEAD"], cwd=PROJECT_ROOT,
                              capture_output=True, text=True, check=True)
         return out.stdout.strip()
-    except Exception:
+    except Exception: # noqa: BLE001
         return ""
 
 
-def _aggregate(fold_results: list[dict]) -> dict:
-    """Mean/std of test metrics + AUC over completed folds."""
+def _aggregate(fold_results) -> dict:
+    folds = fold_results.values() if isinstance(fold_results, dict) else fold_results
     keys = ("acc", "bacc", "f1", "sens", "spec")
     agg: dict[str, float] = {}
     for k in keys:
-        vals = [f["test_metrics"][k] for f in fold_results]
+        vals = [f["test_metrics"][k] for f in folds]
         agg[f"{k}_mean"] = float(np.mean(vals))
         agg[f"{k}_std"] = float(np.std(vals))
-    aucs = [f["test_auc"] for f in fold_results if f["test_auc"] is not None]
+    aucs = [f["test_auc"] for f in folds if f["test_auc"] is not None]
     agg["auc_mean"] = float(np.mean(aucs))
     agg["auc_std"] = float(np.std(aucs))
     return agg
@@ -305,10 +291,16 @@ def main() -> None:
     device = "cuda" if torch.cuda.is_available() else "cpu"
 
     dataset, n_channels, n_samples = _load_dataset(args)
-    n_classes = 1 if args.loss == "bce" else 2
+
+    windows = (
+        int(min(s["eeg"].shape[0] for s in dataset.samples))
+        if args.modal == "eeg" 
+        else int(dataset.min_windows)
+    )
+    n_classes = 1 
 
     header = build_model(args.model, n_channels, n_classes=n_classes, n_samples=n_samples, dropout=args.dropout)
-    total, trainable, frozen = count_parameters(header)
+    total, trainable, _ = count_parameters(header)
     gpu = torch.cuda.get_device_name(0) if torch.cuda.is_available() else "CPU"
 
     output_root = Path(args.output_root) if args.output_root else (
@@ -335,36 +327,21 @@ def main() -> None:
         print("=" * 70)
 
         logger = ClassificationLogger()
-        fold_results = []
+        fold_results: dict[str, dict] = {}
         results = {
-            "experiment": {
-                "name": "unimodal_sngkf",
-                "model": args.model,
-                "modal": args.modal,
-                "channels": args.channels,
-                "tag": args.tag,
-                "timestamp": datetime.now().isoformat(),
-                "git_commit": _git_commit(),
-            },
             "config": {
-                "model": args.model,
-                "modal": args.modal,
-                "channels": args.channels,
-                "lr": args.lr,
-                "wd": args.weight_decay,
-                "epochs": args.epochs,
-                "bb_patience": args.patience,
-                "max_windows": args.max_windows,
-                "outer_folds": args.k,
-                "inner_folds": args.inner_splits,
+                "name": "unimodal_sngkf",
+                "timestamp": datetime.now(UTC).isoformat(),
+                "git_commit": _git_commit(),
+                "windows": windows,
+                "tag": args.tag,
                 "cli": vars(args),
             },
             "test": {},
-            "folds": [],
-            "summary": {},
+            "folds": {},
         }
 
-        def write_results() -> None:
+        def write_results(out_dir=out_dir, results=results) -> None:
             with open(out_dir / "results.json", "w", encoding="utf-8") as fh:
                 json.dump(results, fh, indent=2)
 
@@ -380,33 +357,26 @@ def main() -> None:
                 model, best_epoch, vl_m = train_fold(
                     model, inner_train_loader, inner_val_loader, args.epochs, args.lr,
                     args.weight_decay, args.patience, device, logger, mean, std,
-                    args.label_smoothing, args.loss,
-                    bce_pos_weight=not args.no_bce_pos_weight,
-                    pos_weight_override=args.pos_weight,
-                    early_stop_on=args.early_stop_on,
+                    pos_weight=args.pos_weight, early_stop_on=args.early_stop_on
                 )
                 inner_best.append(best_epoch)
                 inner_metrics.append(vl_m)
                 del model
                 torch.cuda.empty_cache()
 
-            avg_best_ep = int(round(np.mean(inner_best)))
+            avg_best_ep = round(float(np.mean(inner_best)))
             mean, std = channel_stats(outer_loader)
             model = build_model(args.model, n_channels, n_classes=n_classes,
                                 n_samples=n_samples, dropout=args.dropout).to(device)
             model = train_fixed_epochs(
                 model, outer_loader, avg_best_ep, args.lr, args.weight_decay, device,
-                mean, std, args.label_smoothing, args.loss,
-                bce_pos_weight=not args.no_bce_pos_weight,
-                pos_weight_override=args.pos_weight,
+                mean, std, pos_weight=args.pos_weight,
             )
 
             fres = run_fold_test(model, test_loader, device, mean, std)
             inner_means = {k: float(np.mean([m[k] for m in inner_metrics])) for k in ("bacc", "f1", "sens", "spec")}
             fold_res = {
-                "fold": fold_index,
                 "test_metrics": fres["test_metrics"],
-                "test_bacc": fres["test_metrics"]["bacc"],
                 "test_auc": fres["test_auc"],
                 "test_cm": fres["test_cm_subject"],
                 "n_train": len(set(outer_loader.dataset.names)),
@@ -414,12 +384,13 @@ def main() -> None:
                 "test_subjects": sorted(set(test_loader.dataset.names)),
                 "inner_metrics": inner_means,
             }
-            fold_results.append(fold_res)
+            fold_results[f"fold {fold_index}"] = fold_res
             results["folds"] = fold_results
             results["test"] = _aggregate(fold_results)
-            results["summary"] = results["test"]
+
             logger.log_fold_test(fres["test_true"], fres["test_pred"], fres["test_auc"])
             write_results()
+
             del model
             torch.cuda.empty_cache()
 
