@@ -45,6 +45,11 @@ def normalize_channels(x, mean, std):
     return (x - mean.view(shape)) / (std.view(shape) + 1e-8)
 
 
+def _window_norm(v: torch.Tensor) -> torch.Tensor:
+    """Per-window z-score (each window normalized by its own mean/std)."""
+    return (v - v.mean(dim=(1, 2), keepdim=True)) / (v.std(dim=(1, 2), keepdim=True) + 1e-8)
+
+
 def make_criterion(device, train_loader=None, pos_weight=None):
     pw = None
     if pos_weight is not None:
@@ -75,14 +80,12 @@ def subject_prob(logits, n_subjects, windows):
         return torch.sigmoid(pooled[:, 0])
     return pooled.softmax(dim=1)[:, 1]
 
+# def subject_prob(logits, n_subjects, windows):
+#     probs = torch.sigmoid(logits).reshape(n_subjects, windows, -1).mean(dim=1)
+#     return probs[:, 0]
 
-def forward_batch(model, x, y, mean, std, device):
-    if x.dim() == 4:
-        flat, windows = x.reshape(x.shape[0] * x.shape[1], *x.shape[2:]), x.shape[1]
-        logits = model(normalize_channels(flat, mean, std).to(device))
-        return logits, expand_labels(y, windows).to(device)
-    normalized = normalize_channels(x, mean, std)
-    return model(normalized.to(device)), y.to(device)
+def forward_batch(model, x, y, device):
+    return model(_window_norm(x).to(device)), y.to(device)
 
 
 def build_model(name, n_channels, n_classes, n_samples, dropout):
@@ -107,11 +110,11 @@ def confusion_matrix(true, pred):
 
 
 def train_fold(model, train_loader, val_loader, epochs, lr, weight_decay,
-               patience, device, logger, mean, std, pos_weight=None, early_stop_on="subject-bacc"):
+               patience, device, logger, pos_weight=None, early_stop_on="subject-bacc"):
     
     criterion = make_criterion(device, train_loader=train_loader, pos_weight=pos_weight)
     optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=weight_decay)
-    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode="max", factor=0.5, patience=10)
+    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode="max", factor=0.5, patience=5)
 
     best, best_state, best_epoch, patience_left = -1.0, None, 0, 0
     logger.log_header()
@@ -120,7 +123,7 @@ def train_fold(model, train_loader, val_loader, epochs, lr, weight_decay,
         model.train()
         tr_loss, tr_correct, tr_total = 0.0, 0, 0
         for name, xb, yb in train_loader:
-            logits, yf = forward_batch(model, xb, yb, mean, std, device)
+            logits, yf = forward_batch(model, xb, yb, device)
             optimizer.zero_grad()
             tloss = step_loss(criterion, logits, yf)
             tloss.backward()
@@ -135,7 +138,7 @@ def train_fold(model, train_loader, val_loader, epochs, lr, weight_decay,
         subj_logit, subj_count, subj_label = {}, {}, {}
         with torch.no_grad():
             for name, xb, yb in val_loader:
-                logits, yf = forward_batch(model, xb, yb, mean, std, device)
+                logits, yf = forward_batch(model, xb, yb, device)
                 val_loss += step_loss(criterion, logits, yf).item() * len(yf)
                 val_true.extend(yf.cpu().tolist())
                 val_pred.extend(binary_predictions(logits).cpu().tolist())
@@ -169,21 +172,21 @@ def train_fold(model, train_loader, val_loader, epochs, lr, weight_decay,
 
 
 def train_fixed_epochs(model, train_loader, epochs, lr, weight_decay, device,
-                       mean, std, pos_weight=None):
+                       pos_weight=None):
     
     criterion = make_criterion(device, train_loader=train_loader, pos_weight=pos_weight)
     optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=weight_decay)
     model.train()
     for _ in range(max(epochs, 1)):
         for name, xb, yb in train_loader:
-            logits, yf = forward_batch(model, xb, yb, mean, std, device)
+            logits, yf = forward_batch(model, xb, yb, device)
             optimizer.zero_grad()
             step_loss(criterion, logits, yf).backward()
             optimizer.step()
     return model
 
 
-def run_fold_test(model, test_loader, device, mean, std) -> dict:
+def run_fold_test(model, test_loader, device) -> dict:
     true_subj, pred_subj, prob_subj = [], [], []
     true_win, pred_win = [], []
 
@@ -191,7 +194,7 @@ def run_fold_test(model, test_loader, device, mean, std) -> dict:
     with torch.no_grad():
         for names, x, y in test_loader:
             flat, windows = x.reshape(x.shape[0] * x.shape[1], *x.shape[2:]), x.shape[1]
-            logits = model(normalize_channels(flat, mean, std).to(device)).cpu()
+            logits = model(_window_norm(flat).to(device)).cpu()
             yf = expand_labels(y, windows)
             true_win.extend(yf.tolist())
             pred_win.extend(binary_predictions(logits).tolist())
@@ -358,12 +361,11 @@ def main() -> None:
             inner_metrics = []
             for inner_index, (inner_train_loader, inner_val_loader) in enumerate(inner_folds, start=1):
                 print(f"  --- INNER FOLD {inner_index} ---")
-                mean, std = channel_stats(inner_train_loader)
                 model = build_model(args.model, n_channels, n_classes=n_classes,
                                     n_samples=n_samples, dropout=args.dropout).to(device)
                 model, best_epoch, vl_m = train_fold(
                     model, inner_train_loader, inner_val_loader, args.epochs, args.lr,
-                    args.weight_decay, args.patience, device, logger, mean, std,
+                    args.weight_decay, args.patience, device, logger,
                     pos_weight=args.pos_weight, early_stop_on=args.early_stop_on
                 )
                 inner_best.append(best_epoch)
@@ -372,15 +374,14 @@ def main() -> None:
                 torch.cuda.empty_cache()
 
             avg_best_ep = round(float(np.mean(inner_best)))
-            mean, std = channel_stats(outer_loader)
             model = build_model(args.model, n_channels, n_classes=n_classes,
                                 n_samples=n_samples, dropout=args.dropout).to(device)
             model = train_fixed_epochs(
                 model, outer_loader, avg_best_ep, args.lr, args.weight_decay, device,
-                mean, std, pos_weight=args.pos_weight,
+                pos_weight=args.pos_weight,
             )
 
-            fres = run_fold_test(model, test_loader, device, mean, std)
+            fres = run_fold_test(model, test_loader, device)
             inner_means = {k: float(np.mean([m[k] for m in inner_metrics])) for k in ("bacc", "f1", "sens", "spec")}
             fold_res = {
                 "test_metrics": fres["test_metrics"],
@@ -400,10 +401,7 @@ def main() -> None:
             
             if args.save_model:
                 torch.save(model.state_dict(), out_dir / f"fold_{fold_index}.pt")
-                torch.save(
-                    {"mean": mean.cpu(), "std": std.cpu()},
-                    out_dir / f"fold_{fold_index}_stats.pt",
-                )
+
 
             del model
             torch.cuda.empty_cache()
