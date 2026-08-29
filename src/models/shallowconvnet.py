@@ -1,11 +1,9 @@
 """ShallowConvNet (Schirrmeister et al., 2017) adapted for MODMA."""
 
-from __future__ import annotations 
-
+from __future__ import annotations
 
 import torch
-import torch.nn as nn
-from torch import Tensor
+from torch import Tensor, nn
 
 
 class ShallowConvNet(nn.Module):
