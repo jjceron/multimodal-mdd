@@ -9,7 +9,7 @@ import numpy as np
 import pandas as pd
 import torch
 from scipy import signal as sg
-from sklearn.model_selection import StratifiedGroupKFold
+from sklearn.model_selection import StratifiedGroupKFold, StratifiedShuffleSplit
 from torch.utils.data import DataLoader, Dataset
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
@@ -215,9 +215,9 @@ def build_audio_subjects(ds: MODMAAudioDataset) -> list[dict]:
 
 
 def create_audio_dataloaders(dataset, k_folder=5, batch_size=16, shuffle=True,
-                             split_seed=42, inner_split=5, num_workers=0,
+                             split_seed=42, val_ratio=0.2, num_workers=0,
                              pin_memory=False):
-    """Nested subject-aware dataloaders (variable windows per subject, no min truncation)."""
+    """Single-CV subject-aware dataloaders (variable windows per subject, no min truncation)."""
     subjects, labels, data = [], [], []
     for s in dataset.samples:
         subjects.append(s["participant_id"])
@@ -226,7 +226,7 @@ def create_audio_dataloaders(dataset, k_folder=5, batch_size=16, shuffle=True,
 
     class SubjectDataset(Dataset):
         def __init__(self, idx):
-            self.X = [data[i] for i in idx] # each [W_i, 64, F]
+            self.X = [data[i] for i in idx]  # each [W_i, 64, F]
             self.y = torch.tensor([labels[i] for i in idx], dtype=torch.long)
             self.names = [subjects[i] for i in idx]
 
@@ -259,27 +259,24 @@ def create_audio_dataloaders(dataset, k_folder=5, batch_size=16, shuffle=True,
                                  random_state=split_seed)
     folds = []
     for tr_val_idx, test_idx in outer.split(data, labels, groups=subjects):
-        inner = StratifiedGroupKFold(n_splits=inner_split, shuffle=shuffle,
-                                     random_state=split_seed)
-        inner_folds = []
-        for tr_idx, val_idx in inner.split([data[i] for i in tr_val_idx],
-                                           [labels[i] for i in tr_val_idx],
-                                           groups=[subjects[i] for i in tr_val_idx]):
-            tr_sub = [tr_val_idx[i] for i in tr_idx]
-            va_sub = [tr_val_idx[i] for i in val_idx]
-            inner_folds.append((
-                DataLoader(WindowDataset(tr_sub), batch_size=batch_size,
-                           shuffle=shuffle, num_workers=num_workers, pin_memory=pin_memory),
-                DataLoader(WindowDataset(va_sub), batch_size=batch_size,
-                           shuffle=False, num_workers=num_workers, pin_memory=pin_memory),
-            ))
+        splitter = StratifiedShuffleSplit(n_splits=1, test_size=val_ratio,
+                                          random_state=split_seed)
+        val_labels = [labels[i] for i in tr_val_idx]
+        tr_idx, val_idx = next(splitter.split(np.zeros(len(tr_val_idx)), val_labels))
+        tr_sub = [tr_val_idx[i] for i in tr_idx]
+        va_sub = [tr_val_idx[i] for i in val_idx]
+
+        train_loader = DataLoader(WindowDataset(tr_sub), batch_size=batch_size,
+                                  shuffle=shuffle, num_workers=num_workers, pin_memory=pin_memory)
+        val_loader = DataLoader(WindowDataset(va_sub), batch_size=batch_size,
+                                shuffle=False, num_workers=num_workers, pin_memory=pin_memory)
         outer_loader = DataLoader(WindowDataset(tr_val_idx),
                                   batch_size=batch_size, shuffle=shuffle,
                                   num_workers=num_workers, pin_memory=pin_memory)
         test_loader = DataLoader(SubjectDataset(test_idx),
                                  batch_size=1, shuffle=False,
                                  num_workers=num_workers, pin_memory=pin_memory)
-        folds.append((inner_folds, outer_loader, test_loader))
+        folds.append((train_loader, val_loader, outer_loader, test_loader))
     return folds
 
 
