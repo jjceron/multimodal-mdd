@@ -1,5 +1,5 @@
 """DeepConvNet (Schirrmeister et al., 2017) adapted for MODMA EEG.
-"""
+""" 
 
 from __future__ import annotations
 
