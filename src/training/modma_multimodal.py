@@ -5,6 +5,7 @@ import json
 from datetime import UTC, datetime
 from pathlib import Path
 
+import subprocess
 import numpy as np
 import torch
 from sklearn.metrics import roc_auc_score
@@ -246,6 +247,19 @@ def _aggregate(fold_results):
     agg["auc_std"] = float(np.std(aucs)) if aucs else None
     return agg
 
+def _git_commit() -> str:
+    try:
+        out = subprocess.run(
+            ["git", "rev-parse", "--short", "HEAD"],
+            cwd=PROJECT_ROOT,
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+        return out.stdout.strip()
+    except Exception:  # noqa: BLE001
+        return ""
+
 
 def load_dataset(args):
     from src.preprocessing.modma_aud import MODMAAudioDataset
@@ -344,6 +358,7 @@ def main():
                 "non_paired_aud": len(subj.non_paired_aud),
                 "kmin": kmin,
                 "cli": vars(args),
+                "git_commit": _git_commit(),
             },
             "test": {},
             "folds": {},
