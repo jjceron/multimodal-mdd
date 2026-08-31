@@ -79,7 +79,6 @@ Each report includes:
 - hyperparameters 
 - validation and test metrics
 - confusion matrix
-- ROC curve
 - learning curves
 - execution metadata (date, runtime and Git commit)
 
