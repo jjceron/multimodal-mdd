@@ -85,9 +85,6 @@ Each report includes:
 
 Reports are stored inside the project's `results/` directory and can be automatically published as CML comments during Pull Requests.
 
-## Methodology Audit
-
-A complete 0-leakage verification is documented in [`docs/appendix_aud.md`](docs/appendix_aud.md). The audit covers all 3 active scripts and confirms that no subject-leakage channels exist in the pipeline.
 
 ## Repository Structure
 
