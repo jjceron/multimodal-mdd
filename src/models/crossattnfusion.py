@@ -16,6 +16,8 @@ class RMSNorm(nn.Module):
 
 
 class CrossModalFusion(nn.Module):
+    """Bidirectional cross-attention: EEG tokens attend to audio and vice versa."""
+
     def __init__(self, dim, n_heads=2, attn_dropout=0.0):
         super().__init__()
         self.dim = dim
@@ -39,7 +41,7 @@ class CrossModalFusion(nn.Module):
         L_k = k.shape[1]
         q = q.view(B, L_q, self.n_heads, self.d_head).transpose(1, 2)
         k = k.view(B, L_k, self.n_heads, self.d_head).transpose(1, 2)
-        v = v.view(B, L_k, self.n_heads, self.d_head).transpose(1, 2)
+        v = k if v is None else v.view(B, L_k, self.n_heads, self.d_head).transpose(1, 2)
         attn = q @ k.transpose(-2, -1) * self.scale
         if mask_kv is not None:
             attn = attn.masked_fill(mask_kv.unsqueeze(1).unsqueeze(2) == 0, float("-inf"))
@@ -49,15 +51,19 @@ class CrossModalFusion(nn.Module):
         return o_proj(out), attn.detach()
 
     def forward(self, eeg, audio, mask_eeg=None, mask_audio=None):
-        e_out, _ = self._attend(self.e_q(eeg), self.a_k(audio), self.a_v(audio), self.e_o, mask_audio)
+        e_out, attn_ea = self._attend(self.e_q(eeg), self.a_k(audio), self.a_v(audio), self.e_o, mask_audio)
         eeg = self.norm_e(eeg + e_out)
-        a_out, _ = self._attend(self.a_q(audio), self.e_k(eeg), self.e_v(eeg), self.a_o, mask_eeg)
+        a_out, attn_ae = self._attend(self.a_q(audio), self.e_k(eeg), self.e_v(eeg), self.a_o, mask_eeg)
         audio = self.norm_a(audio + a_out)
+        self._attn_ea = attn_ea
+        self._attn_ae = attn_ae
         return eeg, audio
 
 
-class SelfAttentionBlock(nn.Module):
-    def __init__(self, dim, n_heads=4, dropout=0.1):
+class EncoderBlock(nn.Module):
+    """Pre-norm self-attention block: one small Transformer encoder layer."""
+
+    def __init__(self, dim, n_heads=2, dropout=0.1):
         super().__init__()
         self.norm1 = nn.LayerNorm(dim)
         self.attn = nn.MultiheadAttention(dim, n_heads, dropout=dropout, batch_first=True)
@@ -71,17 +77,30 @@ class SelfAttentionBlock(nn.Module):
         )
 
     def forward(self, x, mask=None):
-        x = x + self.attn(self.norm1(x), self.norm1(x), self.norm1(x), key_padding_mask=mask)[0]
+        h = self.norm1(x)
+        x, w = self.attn(h, h, h, key_padding_mask=mask)
+        self._attn_self = w.detach()
         return x + self.mlp(self.norm2(x))
 
 
 class CrossAttnFusion(nn.Module):
+    """Orchestrated cross-modal fusion (v2):
+
+    Z_eeg [B, K_e, D_e], Z_aud [B, K_a, D_a]
+      -> project to shared hidden space (per-modality projection + RMSNorm)
+      -> bidirectional cross-attention (CrossModalFusion layers)
+      -> modality-tagged token sequence [B, K_e + K_a, H]
+      -> small Transformer encoder (few-parameter self-attention blocks)
+      -> attention pooling -> subject embedding -> MLP head (logit).
+    """
+
     def __init__(
         self,
         eeg_dim,
         aud_dim,
-        hidden=32,
+        hidden=64,
         n_heads=2,
+        n_cross_layers=1,
         n_self_attn_layers=1,
         dropout=0.5,
         attn_dropout=0.1,
@@ -92,11 +111,12 @@ class CrossAttnFusion(nn.Module):
         self.eeg_rms = RMSNorm(hidden)
         self.aud_rms = RMSNorm(hidden)
         self.feat_drop = nn.Dropout(dropout) if dropout > 0 else nn.Identity()
+
         self.cross_layers = nn.ModuleList(
-            [CrossModalFusion(hidden, n_heads, attn_dropout=attn_dropout)]
+            [CrossModalFusion(hidden, n_heads, attn_dropout=attn_dropout) for _ in range(n_cross_layers)]
         )
-        self.self_attn_layers = nn.ModuleList(
-            [SelfAttentionBlock(hidden, n_heads, attn_dropout) for _ in range(n_self_attn_layers)]
+        self.enc_layers = nn.ModuleList(
+            [EncoderBlock(hidden, n_heads, dropout) for _ in range(n_self_attn_layers)]
         )
         self.head = nn.Sequential(
             nn.Linear(hidden, hidden),
@@ -115,12 +135,6 @@ class CrossAttnFusion(nn.Module):
         for layer in self.cross_layers:
             e, a = layer(e, a, mask_eeg, None)
         z = 0.5 * (e + a)
-        attn_mask = (mask_eeg == 0) if mask_eeg is not None else None
-        for layer in self.self_attn_layers:
-            z = layer(z, mask=attn_mask)
-        if mask_eeg is not None:
-            n = mask_eeg.sum(dim=1, keepdim=True).clamp(min=1)
-            z = (z * mask_eeg.unsqueeze(-1)).sum(dim=1) / n
-        else:
-            z = z.mean(dim=1)
-        return self.head(z).squeeze(-1)
+        for layer in self.enc_layers:
+            z = layer(z)
+        return self.head(z.mean(dim=1)).squeeze(-1)
