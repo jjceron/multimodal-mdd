@@ -3,23 +3,22 @@ from __future__ import annotations
 
 import argparse
 
+import matplotlib
 import numpy as np
 import torch
 from sklearn.metrics import confusion_matrix
 
-import matplotlib
-
 matplotlib.use("Agg")
-import matplotlib.pyplot as plt  # noqa: E402
+import matplotlib.pyplot as plt
 
 from src.models.crossattnfusion import CrossAttnFusion
 from src.models.deepconvnet import DeepConvNet
 from src.models.shallowconvnet import ShallowConvNet
 from src.preprocessing.modma_dataset import MODMASubjects
 from src.training.modma_multimodal import (
+    PROJECT_ROOT,
     _subject_logit,
     load_dataset,
-    PROJECT_ROOT,
 )
 from src.utils.get_seed import set_seed
 

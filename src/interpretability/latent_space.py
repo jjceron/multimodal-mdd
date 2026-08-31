@@ -9,15 +9,15 @@ import numpy as np
 import torch
 
 matplotlib.use("Agg")
-import matplotlib.pyplot as plt  # noqa: E402
+import matplotlib.pyplot as plt
 
 PR = pathlib.Path(__file__).resolve().parents[2]
 
-from src.models.crossattnfusion import CrossAttnFusion  # noqa: E402
-from src.models.deepconvnet import DeepConvNet  # noqa: E402
-from src.models.shallowconvnet import ShallowConvNet  # noqa: E402
-from src.preprocessing.modma_dataset import MODMASubjects  # noqa: E402
-from src.training.modma_multimodal import _features, load_dataset  # noqa: E402
+from src.models.crossattnfusion import CrossAttnFusion
+from src.models.deepconvnet import DeepConvNet
+from src.models.shallowconvnet import ShallowConvNet
+from src.preprocessing.modma_dataset import MODMASubjects
+from src.training.modma_multimodal import _features, load_dataset
 
 
 def _ctx(seed, fold, tag):

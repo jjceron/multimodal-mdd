@@ -2,10 +2,10 @@ from __future__ import annotations
 
 import argparse
 import json
+import subprocess
 from datetime import UTC, datetime
 from pathlib import Path
 
-import subprocess
 import numpy as np
 import torch
 from sklearn.metrics import roc_auc_score

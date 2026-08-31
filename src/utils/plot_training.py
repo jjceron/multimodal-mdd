@@ -11,7 +11,7 @@ import matplotlib
 import numpy as np
 
 matplotlib.use("Agg" if not os.environ.get("DISPLAY") and os.name != "nt" else "TkAgg")
-import matplotlib.pyplot as plt  # noqa: E402
+import matplotlib.pyplot as plt
 
 PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 RESULTS_ROOT = os.path.join(PROJECT_ROOT, "outputs", "results")

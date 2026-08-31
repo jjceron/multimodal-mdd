@@ -107,7 +107,7 @@ class HUSMDataset(Dataset):
             label = self._filename_label(name)
             if label is None:
                 continue
-            cond = "eo" if re.search(r"\sEO\.edf$", name, re.I) else "ec"
+            cond = "eo" if re.search(r"\sEO\.edf$", name, re.IGNORECASE) else "ec"
             if cond == "ec" and not self.use_ec:
                 continue
             if cond == "eo" and not self.use_eo:
