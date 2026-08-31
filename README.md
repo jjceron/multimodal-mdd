@@ -94,14 +94,14 @@ crossmodal-mdd/
 │   ├── models/            — Neural network architectures (DeepConvNet, ShallowConvNet, CrossAttnFusion)
 │   ├── training/          — Training pipelines (modma_multimodal.py, etc.)
 │   ├── preprocessing/     — EEG/audio preprocessing pipelines
-│   ├── interpretability/  — Latent space, confusion matrices, ROC, contribution analysis
+│   ├── interpretability/  — Latent space, confusion matrices, contribution analysis
 │   └── utils/             — Evaluation, plotting, logging utilities
 ├── data/                  — Local datasets (not tracked)
 │   ├── raw/               — Original MODMA data
 │   ├── processed/         — Preprocessed .npz feature matrices
 │   └── cache/             — Cached intermediate results
 ├── outputs/               — Generated artifacts
-│   ├── figures/           — Training curves, confusion matrices, latent space, ROC
+│   ├── figures/           — Training curves, confusion matrices, latent space
 │   ├── pretrained/        — HUSM EEG backbone weights
 │   └── results/           — Experiment JSON reports per fold/seed
 
