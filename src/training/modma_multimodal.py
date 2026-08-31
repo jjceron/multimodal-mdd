@@ -436,7 +436,7 @@ def main():
             "training curves": {},
         }
 
-        def write_results():
+        def write_results(out_dir, results):
             with open(out_dir / "results.json", "w", encoding="utf-8") as fh:
                 json.dump(results, fh, indent=2)
 
