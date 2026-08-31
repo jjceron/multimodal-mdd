@@ -71,3 +71,30 @@ class MODMASubjects:
             test_ids = list(tei)
             folds.append((train_ids, val_ids, test_ids))
         return folds
+
+    def get_subject_stats(self, modality: str = "both") -> dict:
+        """Compute per-subject mean/std for normalization (like unimodal subj_stats)."""
+        stats = {}
+        if modality in ("both", "eeg"):
+            for pid, data in self.paired.items():
+                eeg = data["eeg"]
+                stats[pid] = stats.get(pid, {})
+                stats[pid]["eeg_mean"] = float(eeg.mean())
+                stats[pid]["eeg_std"] = float(eeg.std()) + 1e-8
+            for pid, data in self.non_paired_eeg.items():
+                eeg = data["eeg"]
+                stats[pid] = stats.get(pid, {})
+                stats[pid]["eeg_mean"] = float(eeg.mean())
+                stats[pid]["eeg_std"] = float(eeg.std()) + 1e-8
+        if modality in ("both", "aud"):
+            for pid, data in self.paired.items():
+                aud = data["aud"]
+                stats[pid] = stats.get(pid, {})
+                stats[pid]["aud_mean"] = float(aud.mean())
+                stats[pid]["aud_std"] = float(aud.std()) + 1e-8
+            for pid, data in self.non_paired_aud.items():
+                aud = data["aud"]
+                stats[pid] = stats.get(pid, {})
+                stats[pid]["aud_mean"] = float(aud.mean())
+                stats[pid]["aud_std"] = float(aud.std()) + 1e-8
+        return stats
