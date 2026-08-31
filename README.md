@@ -49,7 +49,6 @@ Performance is reported using:
 - F1-score
 - Sensitivity
 - Specificity
-- ROC-AUC
 
 The main comparison is against unimodal DeepConvNet (EEG) and ShallowConvNet (speech) trained under the exact same evaluation protocol.
 
