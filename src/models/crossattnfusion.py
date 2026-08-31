@@ -16,7 +16,7 @@ class RMSNorm(nn.Module):
 
 
 class CrossModalFusion(nn.Module):
-    """Bidirectional cross-attention: EEG tokens attend to audio and vice versa."""
+    """Bidirectional cross-attention (EEG <-> audio)."""
 
     def __init__(self, dim, n_heads=2, attn_dropout=0.0):
         super().__init__()
@@ -61,7 +61,7 @@ class CrossModalFusion(nn.Module):
 
 
 class EncoderBlock(nn.Module):
-    """Pre-norm self-attention block: one small Transformer encoder layer."""
+    """Pre-norm self-attention Transformer encoder layer."""
 
     def __init__(self, dim, n_heads=2, dropout=0.1):
         super().__init__()
@@ -84,15 +84,7 @@ class EncoderBlock(nn.Module):
 
 
 class CrossAttnFusion(nn.Module):
-    """Orchestrated cross-modal fusion (v2):
-
-    Z_eeg [B, K_e, D_e], Z_aud [B, K_a, D_a]
-      -> project to shared hidden space (per-modality projection + RMSNorm)
-      -> bidirectional cross-attention (CrossModalFusion layers)
-      -> modality-tagged token sequence [B, K_e + K_a, H]
-      -> small Transformer encoder (few-parameter self-attention blocks)
-      -> attention pooling -> subject embedding -> MLP head (logit).
-    """
+    """Cross-modal fusion: project -> cross-attention -> mean-pool -> head."""
 
     def __init__(
         self,
