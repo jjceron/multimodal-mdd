@@ -23,7 +23,7 @@ This repository investigates an **orchestrated cross-modal attention** architect
 
 - **Stage 3 — Strict nested cross-validation:** a subject-wise Stratified Group K-Fold split prevents information leakage between train and test subjects. Inner folds are used exclusively for early stopping and hyperparameter selection.
 
-- **Stage 4 — Backbone pre-training:** unimodal encoders are trained using all available subjects of their corresponding modality (paired and unpaired), then frozen before multimodal training.
+- **Stage 4 — Backbone pre-training:** unimodal encoders are trained using all available subjects of their corresponding modality (paired and unpaired), then frozen before multimodal training. The EEG backbone (DeepConvNet) is pre-trained on the external **HUSM** cohort (MDD/HC, >300 subjects, no overlap with MODMA) to provide a leak-free initialization.
 
 - **Stage 5 — Cross-modal fusion:** projected node embeddings interact through bidirectional multi-head cross-attention, optionally followed by self-attention layers. Window representations are aggregated and classified through a lightweight multilayer perceptron.
 
@@ -69,10 +69,6 @@ conda env export --from-history > environment.yml
 conda env create -f environment.yml
 ```
 
-## Key Results
-
-*Work in progress.*
-
 
 ## Experiment Reports
 
@@ -99,17 +95,25 @@ A complete 0-leakage verification is documented in [`docs/appendix_aud.md`](docs
 ```text
 crossmodal-mdd/
 ├── src/
-│   ├── models/          — Neural network architectures
-│   ├── training/        — 3 active training pipelines
-│   └── utils/           — Evaluation and utility functions
-├── scripts/             — Training, analysis and report generation
-├── configs/             — Hyperparameter configurations
-├── data/                — Local datasets (not tracked)
-├── results/             — Published experiment reports and figures
-├── docs/                — Paper source, audit, and documentation
-├── tests/               — Unit and integration tests
-├── .github/             — GitHub Actions workflows (CI, CML)
-└── requirements.txt     — Project dependencies
+│   ├── models/            — Neural network architectures (DeepConvNet, ShallowConvNet, CrossAttnFusion)
+│   ├── training/          — Training pipelines (modma_multimodal.py, etc.)
+│   ├── preprocessing/     — EEG/audio preprocessing pipelines
+│   ├── interpretability/  — Latent space, confusion matrices, ROC, contribution analysis
+│   └── utils/             — Evaluation, plotting, logging utilities
+├── data/                  — Local datasets (not tracked)
+│   ├── raw/               — Original MODMA data
+│   ├── processed/         — Preprocessed .npz feature matrices
+│   └── cache/             — Cached intermediate results
+├── outputs/               — Generated artifacts
+│   ├── figures/           — Training curves, confusion matrices, latent space, ROC
+│   ├── pretrained/        — HUSM EEG backbone weights
+│   └── results/           — Experiment JSON reports per fold/seed
+
+├── test/                  — Unit tests (test_imports.py)
+├── .github/               — GitHub Actions workflows (CI, CML, dependabot)
+├── pyproject.toml         — Project metadata and dependencies
+├── poetry.lock            — Locked dependency versions
+└── environment.yml        — Conda environment specification
 ```
 
 ## Data
@@ -125,6 +129,8 @@ The complete MODMA collection includes multiple partially overlapping modalities
 - Psychometric and demographic assessments
 
 This project focuses on the paired subset containing **resting-state EEG and speech recordings**, following a strict subject-level evaluation protocol to prevent information leakage. Unpaired EEG-only and speech-only subjects are used exclusively during unimodal backbone pre-training and are never included in multimodal evaluation.
+
+Additional EEG data for HUSM pre-training: [EEG Data New (figshare)](https://figshare.com/articles/dataset/EEG_Data_New/4244171).
 
 All data are obtained from the official MODMA repository under its corresponding data-use agreement. Participants provided informed consent, the study received institutional ethical approval, and personally identifiable information was removed before public release. Users of this repository are responsible for complying with the MODMA license and usage conditions.
 
