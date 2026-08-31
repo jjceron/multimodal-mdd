@@ -1,3 +1,4 @@
+"""HUSM/MUMTAZ EEG dataset (MDD vs HC, 10-20 channels)."""
 from __future__ import annotations
 
 import re
@@ -26,9 +27,7 @@ def _base_channel(name: str) -> str | None:
     if not m:
         return None
     base = m.group(1)
-    if base in HUSM_CHANNELS:
-        return base
-    return None
+    return base if base in HUSM_CHANNELS else None
 
 
 def _window(eeg, fs, window_sec, overlap):
@@ -71,11 +70,7 @@ def _process_edf(path: Path, fs_target: float | None, lowcut, highcut,
 
 
 class HUSMDataset(Dataset):
-    """Window-level HUSM/MUMTAZ dataset (MDD vs HC via 10-20 EEG).
-
-    Labels are read from the filename prefix: ``H S*.edf`` -> HC (0),
-    ``MDD S*.edf`` -> MDD (1). _TASK files are ignored.
-    """
+    """Window-level HUSM EEG; labels from filename prefix (H=HC, MDD=MDD)."""
 
     def __init__(
         self,
@@ -93,7 +88,6 @@ class HUSMDataset(Dataset):
         self.fs_target = fs_target
         self.window_sec, self.overlap = window_sec, overlap
         self.use_ec, self.use_eo = use_ec, use_eo
-
         self.windows, self.labels = [], []
         self._load()
         if not self.windows:
@@ -138,14 +132,14 @@ class HUSMDataset(Dataset):
     def __len__(self) -> int:
         return sum(len(w) for w in self.windows)
 
-    def __getitem__(self, idx: int) -> tuple[torch.Tensor, int]:
+    def __getitem__(self, idx: int):
         for win, label in zip(self.windows, self.labels):
             if idx < len(win):
                 return win[idx], label
             idx -= len(win)
         raise IndexError(idx)
 
-    def window_tensors(self) -> tuple[torch.Tensor, torch.Tensor]:
+    def window_tensors(self):
         xs = torch.cat([w for w in self.windows], dim=0)
         ys = torch.tensor(
             [lab for lab, w in zip(self.labels, self.windows) for _ in range(len(w))],
