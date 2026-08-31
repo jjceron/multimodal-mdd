@@ -134,7 +134,13 @@ class CrossAttnFusion(nn.Module):
             a = self.feat_drop(a)
         for layer in self.cross_layers:
             e, a = layer(e, a, mask_eeg, None)
+            self._cross_ea = getattr(layer, "_attn_ea", None)
+            self._cross_ae = getattr(layer, "_attn_ae", None)
         z = 0.5 * (e + a)
         for layer in self.enc_layers:
             z = layer(z)
-        return self.head(z.mean(dim=1)).squeeze(-1)
+            self._self_attn = getattr(layer, "_attn_self", None)
+        pooled = z.mean(dim=1)
+        self._pooled = pooled
+        self._z_enc = z
+        return self.head(pooled).squeeze(-1)
