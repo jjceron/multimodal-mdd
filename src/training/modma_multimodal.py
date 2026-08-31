@@ -90,6 +90,61 @@ def _training_fusion_criterion(device, train_ids, subj):
     return make_criterion(device, pos_weight=pw)
 
 
+def train_husm_backbone(device, epochs=50, lr=3e-4, wd=1e-2, dropout=0.5,
+                        batch_size=256, lowcut=0.5, highcut=50.0,
+                        fs_target=256.0, window_sec=2.0, overlap=0.5,
+                        save_path=None):
+    from src.preprocessing.husm_dataset import HUSMDataset
+
+    ds = HUSMDataset(lowcut=lowcut, highcut=highcut, fs_target=fs_target,
+                     window_sec=window_sec, overlap=overlap)
+    xs, ys = ds.window_tensors()
+    xs = xs.to(device)
+    ys = ys.float().to(device)
+    model = DeepConvNet(ds.n_channels, 1, ds.n_samples, dropout).to(device)
+    opt = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=wd, foreach=False)
+    crit = make_criterion(device, pos_weight=1.0)
+    n = len(xs)
+    print(f"  HUSM: windows={n} (n_channels={ds.n_channels}, n_samples={ds.n_samples})")
+    model.train()
+    for ep in range(1, max(epochs, 1) + 1):
+        idx = torch.randperm(n)
+        ep_loss, nb = 0.0, 0
+        for i in range(0, n, batch_size):
+            bi = idx[i : i + batch_size]
+            xb, yb = xs[bi], ys[bi]
+            opt.zero_grad()
+            loss = crit(model(_window_norm(xb)).squeeze(-1), yb)
+            loss.backward()
+            opt.step()
+            ep_loss += loss.item() * len(bi)
+            nb += len(bi)
+        if ep == 1 or ep % 10 == 0 or ep == max(epochs, 1):
+            print(f"  HUSM epoch {ep}/{max(epochs, 1)}  loss={ep_loss / max(nb, 1):.4f}")
+    if save_path:
+        Path(save_path).parent.mkdir(parents=True, exist_ok=True)
+        torch.save(model.state_dict(), save_path)
+        print(f"  HUSM backbone saved: {save_path}")
+    return model
+
+
+def load_husm_backbone(n_channels, n_samples, dropout, path, device):
+    model = DeepConvNet(n_channels, 1, n_samples, dropout).to(device)
+    model.load_state_dict(torch.load(path, map_location=device))
+    return model
+
+
+def load_pretrained_aud_backbone(aud_n_channels, aud_n_samples, dropout, seed, fold_index, device):
+    base = PROJECT_ROOT / "outputs/results/unimodals/aud"
+    model_dir = base / f"tagv1wnorm_sseed{seed}_sngkf_aud_shallowconvnet_64mel"
+    pt_path = model_dir / f"fold_{fold_index}.pt"
+    if not pt_path.exists():
+        raise FileNotFoundError(f"Pretrained AUD backbone not found: {pt_path}")
+    model = ShallowConvNet(aud_n_channels, 1, aud_n_samples, dropout).to(device)
+    model.load_state_dict(torch.load(pt_path, map_location=device))
+    return model
+
+
 def train_fusion(beeg, baud, fusion, train_ids, val_ids, subj, epochs, lr, wd, patience, device, logger, bs=4, finetune=False):
     beeg.requires_grad_(finetune)
     baud.requires_grad_(finetune)
@@ -288,22 +343,28 @@ def parse_args():
     parser.add_argument("--val-ratio", type=float, default=0.3)
     parser.add_argument("--split-seed", type=int, nargs="+", default=[42])
     parser.add_argument("--seed", type=int, default=42)
-    parser.add_argument("--bb-epochs", type=int, default=100)
-    parser.add_argument("--bb-lr", type=float, default=5e-4)
-    parser.add_argument("--bb-wd", type=float, default=1e-3)
-    parser.add_argument("--epochs", type=int, default=50)
-    parser.add_argument("--lr", type=float, default=3e-4)
-    parser.add_argument("--weight-decay", type=float, default=1e-2)
-    parser.add_argument("--dropout", type=float, default=0.5)
-    parser.add_argument("--patience", type=int, default=10)
+    parser.add_argument("--bb-epochs", type=int, default=250)
+    parser.add_argument("--bb-lr", type=float, default=3e-4)
+    parser.add_argument("--bb-wd", type=float, default=1e-2)
+    parser.add_argument("--epochs", type=int, default=60)
+    parser.add_argument("--lr", type=float, default=1e-4)
+    parser.add_argument("--weight-decay", type=float, default=5e-2)
+    parser.add_argument("--dropout", type=float, default=0.6)
+    parser.add_argument("--patience", type=int, default=15)
     parser.add_argument("--hidden", type=int, default=32)
     parser.add_argument("--n-heads", type=int, default=2)
-    parser.add_argument("--fusion-dropout", type=float, default=0.5)
+    parser.add_argument("--fusion-dropout", type=float, default=0.6)
     parser.add_argument("--attn-dropout", type=float, default=0.1)
     parser.add_argument("--n-self-attn-layers", type=int, default=1)
     parser.add_argument("--batch-size", type=int, default=4)
     parser.add_argument("--finetune", action="store_true", help="Fine-tune backbones jointly (end-to-end)")
+    parser.add_argument("--save-model", action="store_true", help="Save multimodal model checkpoints per fold")
     parser.add_argument("--tag", type=str, default="v1")
+    parser.add_argument("--pretrain-husm", action="store_true", help="Train the EEG backbone on the HUSM cohort (MDD/HC)")
+    parser.add_argument("--husm-epochs", type=int, default=50)
+    parser.add_argument("--husm-lr", type=float, default=3e-4)
+    parser.add_argument("--husm-wd", type=float, default=1e-2)
+    parser.add_argument("--husm-weights", type=str, default=str(PROJECT_ROOT / "outputs/pretrained/husm_deepconvnet_19_256.pt"))
     return parser.parse_args()
 
 
@@ -344,6 +405,16 @@ def main():
     non_eeg = {pid: {"label": s["label"], "eeg": s["eeg"]} for pid, s in subj.non_paired_eeg.items()}
     non_aud = {pid: {"label": s["label"], "aud": s["aud"]} for pid, s in subj.non_paired_aud.items()}
 
+    print("\n-- HUSM pretrain (leak-free external cohort for the EEG backbone) --")
+    husm_weights = Path(args.husm_weights)
+    if args.pretrain_husm or not husm_weights.exists():
+        train_husm_backbone(
+            device, epochs=args.husm_epochs, lr=args.husm_lr, wd=args.husm_wd,
+            dropout=args.dropout, save_path=str(husm_weights),
+        )
+    else:
+        print(f"  Using existing HUSM backbone: {husm_weights}")
+
     for split_seed in args.split_seed:
         folds = subj.folds(k=args.k, val_ratio=args.val_ratio, split_seed=split_seed)
         out_dir = PROJECT_ROOT / "outputs/results/multimodals" / f"tag{args.tag}_sseed{split_seed}_sngkf_multimodal"
@@ -374,7 +445,7 @@ def main():
             if set(train_ids) & set(val_ids) or set(train_ids) & set(test_ids) or set(val_ids) & set(test_ids):
                 raise RuntimeError("Subject overlap in multimodal fold")
 
-            print("\n-- Phase 1: pretrain backbones (train + no-paired, exclude val/test) --")
+            print("\n-- Phase 1: load frozen backbones (HUSM-EEG + pretrained-AUD) --")
             bb_eeg = {pid: {"label": subj.paired[pid]["label"], "eeg": subj.paired[pid]["eeg"]} for pid in train_ids}
             bb_eeg.update(non_eeg)
             bb_aud = {pid: {"label": subj.paired[pid]["label"], "aud": subj.paired[pid]["aud"]} for pid in train_ids}
@@ -382,12 +453,10 @@ def main():
             if set(bb_eeg) & (set(val_ids) | set(test_ids)) or set(bb_aud) & (set(val_ids) | set(test_ids)):
                 raise RuntimeError("Backbone leakage: backbone subjects overlap val/test")
 
-            beeg = DeepConvNet(eeg_n_channels, 1, eeg_n_samples, args.dropout).to(device)
-            baud = ShallowConvNet(aud_n_channels, 1, aud_n_samples, args.dropout).to(device)
-            print("\n  Pretraining EEG backbone...")
-            beeg = pretrain_backbone(beeg, bb_eeg, "eeg", args.bb_epochs, args.bb_lr, args.bb_wd, device, "EEG")
-            print("  Pretraining AUD backbone...")
-            baud = pretrain_backbone(baud, bb_aud, "aud", args.bb_epochs, args.bb_lr, args.bb_wd, device, "AUD")
+            beeg = load_husm_backbone(eeg_n_channels, eeg_n_samples, args.dropout, husm_weights, device)
+            baud = load_pretrained_aud_backbone(aud_n_channels, aud_n_samples, args.dropout, split_seed, fold_index, device)
+            beeg.requires_grad_(False)
+            baud.requires_grad_(False)
 
             fusion = CrossAttnFusion(
                 dim_e, dim_a, args.hidden, args.n_heads,
@@ -409,9 +478,8 @@ def main():
                 args.lr, args.weight_decay, device, args.batch_size, args.finetune,
             )
 
-            temp = fit_temperature(beeg, baud, fusion, val_ids, subj.paired, device)
-            fusion.temperature.data = torch.tensor(temp)
-            print(f"  Calibrated temperature (val) = {temp:.3f}")
+            fusion.temperature.data = torch.tensor(1.0)
+            print("  Temperature fixed to 1.0 (no calibration)")
 
             true, pred, prob = evaluate_fusion(beeg, baud, fusion, test_ids, subj.paired, device)
             auc = float(roc_auc_score(true, prob)) if len(set(true.tolist())) > 1 else None
@@ -427,10 +495,11 @@ def main():
             }
             results["folds"] = fold_results
             results["test"] = _aggregate(fold_results)
-            torch.save(
-                {"beeg": beeg.state_dict(), "baud": baud.state_dict(), "fusion": fusion.state_dict()},
-                out_dir / f"fold_{fold_index}.pt",
-            )
+            if args.save_model:
+                torch.save(
+                    {"beeg": beeg.state_dict(), "baud": baud.state_dict(), "fusion": fusion.state_dict()},
+                    out_dir / f"fold_{fold_index}.pt",
+                )
             write_results()
 
         logger.log_summary(n_folds=len(fold_results), split_type="gkf")
