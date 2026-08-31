@@ -1,25 +1,24 @@
 """Plot training diagnostics for MODMA results.
 
-Reads the per-experiment results.json written by src/training/modma_unimodals.py
-and renders training curves, per-fold / overall confusion matrices and ROC.
+Reads results.json produced by src/training (unimodals or multimodal) and
+renders training curves (loss / acc per epoch), best-fold selection, ROC and
+confusion matrices.
 
-Modes (mutually selecting an output):
-  --metric bacc|acc|f1|sens|spec   : train/val curves for the chosen metric
-  --roc                             : per-fold ROC (+ AUC) curves
-  --cm                              : per-fold confusion matrices (windows+subjects)
-  --cm-overall                      : aggregated confusion matrix across folds
-  --all                             : all folds (default when --fold is omitted)
+Modes:
+  --curve (default)                : 1x2 (loss | <metric>) train/val curves
+  --roc                            : per-fold ROC (+ AUC)
+  --cm                             : per-fold confusion matrices (subjects)
+  --best-fold                      : select the fold with best bacc, plot it alone
+  --all                            : plot every fold
 
 Selecting the experiment:
-  --type unimodal|multimodal  --modal eeg|aud  --tag <tag>  [--split-seed]
+  --type unimodal|multimodal  --modal eeg|aud  --tag <tag>  [--split-seed]  [--metric]
 
 Examples:
+  poetry run python -m src.utils.plot_training --type multimodal --modal eeg \
+      --tag v2 --split-seed 42 --curve --best-fold
   poetry run python -m src.utils.plot_training --type unimodal --modal eeg \
-      --tag deepconvnet --metric bacc --all
-  poetry run python -m src.utils.plot_training --type unimodal --modal eeg \
-      --tag deepconvnet --roc --fold 1,3
-  poetry run python -m src.utils.plot_training --type unimodal --modal eeg \
-      --tag deepconvnet --cm-overall
+      --tag deepconvnet --curve --best-fold
 """
 
 from __future__ import annotations
@@ -34,33 +33,33 @@ import matplotlib
 import numpy as np
 
 matplotlib.use("Agg" if not os.environ.get("DISPLAY") and os.name != "nt" else "TkAgg")
-import matplotlib.pyplot as plt
+import matplotlib.pyplot as plt  # noqa: E402
 
 PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 RESULTS_ROOT = os.path.join(PROJECT_ROOT, "outputs", "results")
 FIGURES_ROOT = os.path.join(PROJECT_ROOT, "outputs", "figures")
 
-METRIC_KEYS = {
-    "bacc": "val_bacc",
-    "acc": "val_acc",
-    "f1": "val_f1",
-    "sens": "val_sens",
-    "spec": "val_spec",
+CURVE_KEYS = {
+    "loss": ("train loss", "val loss"),
+    "acc": ("train acc", "val acc"),
+    "bacc": ("train bacc", "val bacc"),
+    "f1": ("train f1", "val f1"),
 }
 
 
 def find_results_path(type_: str, modal: str, split_seed: int, tag: str) -> str:
-    base = os.path.join(RESULTS_ROOT, type_, modal)
-    pattern = os.path.join(
-        base, "**", f"*sseed{split_seed}*tag{tag}", "results.json"
-    )
-    matches = sorted(glob.glob(pattern, recursive=True))
+    if type_ == "multimodal":
+        base = os.path.join(RESULTS_ROOT, "multimodals")
+    else:
+        base = os.path.join(RESULTS_ROOT, "unimodals", modal)
+    pool = sorted(glob.glob(os.path.join(base, "**", "results.json"), recursive=True))
+    matches = [
+        p for p in pool
+        if f"sseed{split_seed}" in p and f"tag{tag}" in p
+    ]
     if not matches:
-        pattern = os.path.join(base, "**", f"*tag{tag}", "results.json")
-        matches = sorted(glob.glob(pattern, recursive=True))
-    if not matches:
-        print(f"ERROR: no results found for --type {type_} --modal {modal} "
-              f"--tag {tag}")
+        print(f"ERROR: no results found for type={type_} modal={modal} "
+              f"seed={split_seed} tag={tag}")
         sys.exit(1)
     return matches[-1]
 
@@ -70,257 +69,164 @@ def load_results(path: str) -> dict:
         return json.load(f)
 
 
-def parse_folds(arg: str | None) -> list[int] | None:
-    if arg is None:
-        return None
-    folds = []
-    for part in arg.split(","):
-        part = part.strip()
-        if part:
-            folds.append(int(part))
-    return folds
-
-
-def select_folds(folds_data, fold_ids: list[int] | None) -> list[dict]:
-    if fold_ids is None:
-        return list(folds_data)
-    by_num = {}
-    for fe in folds_data:
-        by_num[fe["fold"]] = fe
-    selected = []
-    for fid in fold_ids:
-        if fid not in by_num:
-            print(f"WARNING: fold {fid} not found in results (have "
-                  f"{sorted(by_num)})")
-            continue
-        selected.append(by_num[fid])
-    if not selected:
-        print("ERROR: no valid folds selected")
-        sys.exit(1)
-    return selected
-
-
-def _plot_metric_curves(axes, hist: dict, fold_num: int, metric: str,
-                        show_legend: bool):
-    ax_l, ax_r = axes
-    epochs = np.arange(1, len(hist["train_loss"]) + 1)
-    ax_l.plot(epochs, hist["train_loss"], color="blue", label="Train Loss")
-    if hist.get("val_loss"):
-        ax_l.plot(epochs, hist["val_loss"], color="orange", linestyle="--",
-                  label="Val Loss")
-    ax_l.set_title(f"Fold {fold_num} — Loss")
-    ax_l.set_xlabel("Epoch")
-    ax_l.grid(True, alpha=0.3)
-    if show_legend:
-        ax_l.legend(fontsize=7, loc="upper right")
-
-    key = METRIC_KEYS[metric]
-    if hist.get("train_acc"):
-        ax_r.plot(epochs, hist["train_acc"], color="blue", label="Train Acc")
-    if hist.get(key):
-        ax_r.plot(epochs, hist[key], color="orange", linestyle="--",
-                  label=f"Val {metric.upper()}")
-    ax_r.set_title(f"Fold {fold_num} — {metric.upper()}")
-    ax_r.set_xlabel("Epoch")
-    ax_r.grid(True, alpha=0.3)
-    if show_legend:
-        ax_r.legend(fontsize=7, loc="lower right")
-
-
-def _plot_roc(axes, fold_entry: dict, fold_num: int, show_legend: bool):
-    ax_l, ax_r = axes
-    ax_l.axis("off")
-    ax_l.text(0.5, 0.5, f"Fold {fold_num}",
-              ha="center", va="center", transform=ax_l.transAxes)
-
-    roc = fold_entry.get("test_roc") or {}
-    auc = fold_entry.get("test_auc")
-    y_true = roc.get("y_true")
-    y_prob = roc.get("y_prob")
-    if y_true and y_prob:
-        y_true = np.array(y_true, dtype=np.float64)
-        y_prob = np.array(y_prob, dtype=np.float64)
-        threshs = np.sort(np.unique(y_prob))[::-1]
-        fpr, tpr = [0.0], [0.0]
-        for t in threshs:
-            yp = (y_prob >= t).astype(np.float64)
-            tp = (yp * y_true).sum()
-            fp = (yp * (1 - y_true)).sum()
-            fn = ((1 - yp) * y_true).sum()
-            tn = ((1 - yp) * (1 - y_true)).sum()
-            tpr.append(tp / (tp + fn) if (tp + fn) > 0 else 0.0)
-            fpr.append(fp / (fp + tn) if (fp + tn) > 0 else 0.0)
-        tpr.append(1.0)
-        fpr.append(1.0)
-        if auc is None:
-            from sklearn.metrics import roc_auc_score
-            auc = roc_auc_score(y_true, y_prob)
-        ax_r.plot(fpr, tpr, color="orange", linewidth=1.5,
-                  label=f"ROC (AUC={float(auc):.3f})")
+def normalize_folds(results: dict) -> list[dict]:
+    folds = results.get("folds", {})
+    curves = results.get("training curves") or {}
+    out = []
+    if isinstance(folds, dict):
+        for name, fe in folds.items():
+            num = int(str(name).split()[-1])
+            fe = dict(fe)
+            fe["fold"] = num
+            fe["history"] = curves.get(name) or {}
+            out.append(fe)
     else:
-        ax_r.text(0.5, 0.5, "No ROC data", ha="center", va="center",
-                  transform=ax_r.transAxes)
-    ax_r.plot([0, 1], [0, 1], color="blue", linestyle="--", label="Chance")
-    ax_r.set_title(f"Fold {fold_num} — ROC")
-    ax_r.grid(True, alpha=0.3)
-    if show_legend:
-        ax_r.legend(fontsize=7, loc="lower right")
+        for fe in folds:
+            fe = dict(fe)
+            fe["history"] = curves.get(f"fold {fe.get('fold')}") or {}
+            out.append(fe)
+    out.sort(key=lambda f: f["fold"])
+    return out
 
 
-def _trim_cm(cm):
-    cm = np.array(cm)
-    mx = cm.max()
-    return cm, mx if mx > 0 else 1
+def best_fold(folds: list[dict]) -> dict:
+    return max(folds, key=lambda f: f.get("test_metrics", {}).get("bacc", -1.0))
 
 
-def _plot_cm(table, ax, title):
-    cm, vmax = _trim_cm(table)
-    im = ax.imshow(cm, cmap="Blues", vmin=0, vmax=vmax)
-    ax.set_xticks([0, 1])
-    ax.set_yticks([0, 1])
-    ax.set_xticklabels(["HC", "MDD"])
-    ax.set_yticklabels(["HC", "MDD"])
-    ax.set_title(title)
-    for i in range(2):
-        for j in range(2):
-            ax.text(j, i, str(int(cm[i, j])), ha="center", va="center",
-                    fontsize=13, fontweight="bold",
-                    color="white" if cm[i, j] > vmax * 0.5 else "black")
-    return im
+def _plot_curve_1x2(ax, hist: dict, metric: str):
+    trl, vll = CURVE_KEYS["loss"]
+    tra, val = CURVE_KEYS[metric]
+    n = len(hist.get(trl, []))
+    epochs = np.arange(1, n + 1) if n else np.arange(1, 2)
+    if hist.get(trl):
+        ax[0].plot(epochs, hist[trl], color="tab:blue", label="Train")
+        if hist.get(vll):
+            ax[0].plot(epochs, hist[vll], color="tab:red", ls="--",
+                       label="Validation")
+    ax[0].set_xlabel("Epoch")
+    ax[0].set_ylabel("Loss")
+    ax[0].legend()
+    ax[0].grid(True, alpha=0.3)
+    if hist.get(tra):
+        ax[1].plot(epochs, hist[tra], color="tab:blue", label="Train")
+        if hist.get(val):
+            ax[1].plot(epochs, hist[val], color="tab:red", ls="--",
+                       label="Validation")
+    ax[1].set_xlabel("Epoch")
+    ax[1].set_ylabel(metric.upper())
+    ax[1].legend()
+    ax[1].grid(True, alpha=0.3)
 
 
-def _plot_cm_pair(axes, fold_entry: dict, fold_num: int,
-                  show_title: bool = True):
-    kw = fold_entry.get("test_cm_window")
-    ks = fold_entry.get("test_cm_subject")
-    if isinstance(axes, np.ndarray):
-        ax_w, ax_s = axes
+def plot_curves(folds: list[dict], metric: str, out_dir: str | None,
+                save_png: bool, best_only: bool, tag: str):
+    if best_only:
+        folds = [best_fold(folds)]
+    k = len(folds)
+    fig, axes = plt.subplots(1, 2, figsize=(9, 3.4), constrained_layout=True)
+    axes = np.atleast_1d(axes)
+    if k == 1:
+        hist = folds[0].get("history") or {}
+        if hist.get("train loss"):
+            _plot_curve_1x2(axes, hist, metric)
+        else:
+            for ax in axes:
+                ax.text(0.5, 0.5, "No curves", ha="center", va="center",
+                        transform=ax.transAxes)
     else:
-        ax_w = ax_s = axes
-    if kw is not None:
-        _ = _plot_cm(kw, ax_w, f"Fold {fold_num} — Windows" if show_title else "Windows")
-    if ks is not None:
-        _ = _plot_cm(ks, ax_s, f"Fold {fold_num} — Subjects" if show_title else "Subjects")
+        for i, fe in enumerate(folds):
+            hist = fe.get("history") or {}
+            if i == 0:
+                _plot_curve_1x2(axes, hist, metric)
+    name = f"tag{tag}_best_fold_{metric}" if best_only else f"tag{tag}_all_folds_{metric}"
+    _finish(fig, out_dir, name, save_png)
+
+
+def plot_roc(folds: list[dict], out_dir: str | None, save_png: bool):
+    from sklearn.metrics import roc_auc_score
+    fig, ax = plt.subplots(figsize=(4.5, 4.2), constrained_layout=True)
+    for fe in folds:
+        y, p = fe.get("test_roc", {}).get("y_true"), fe.get("test_roc", {}).get("y_prob")
+        if y and p:
+            from sklearn.metrics import roc_curve
+            fpr, tpr, _ = roc_curve(np.asarray(y), np.asarray(p))
+            auc = roc_auc_score(np.asarray(y), np.asarray(p))
+            ax.plot(fpr, tpr, label=f"Fold {fe.get('fold')} (AUC={auc:.3f})")
+    ax.plot([0, 1], [0, 1], "k--")
+    ax.set_xlabel("False Positive Rate")
+    ax.set_ylabel("True Positive Rate")
+    ax.legend(fontsize=7)
+    ax.grid(True, alpha=0.3)
+    _finish(fig, out_dir, "roc_curves", save_png)
+
+
+def plot_cm(folds: list[dict], out_dir: str | None, save_png: bool):
+    n = len(folds)
+    fig, axes = plt.subplots(1, n, figsize=(3.5 * n, 3.4),
+                             constrained_layout=True)
+    axes = np.atleast_1d(axes)
+    for i, fe in enumerate(folds):
+        cm = np.zeros((2, 2))
+        if "test_cm" in fe and fe["test_cm"] is not None:
+            cm = np.array(fe["test_cm"])
+        elif "test_cm_subject" in fe and fe["test_cm_subject"] is not None:
+            cm = np.array(fe["test_cm_subject"])
+        axes[i].imshow(cm, cmap="Blues", vmin=0, vmax=max(cm.max(), 1))
+        axes[i].set_xticks([0, 1])
+        axes[i].set_yticks([0, 1])
+        axes[i].set_xticklabels(["HC", "MDD"])
+        axes[i].set_yticklabels(["HC", "MDD"])
+        axes[i].set_xlabel(f"Fold {fe.get('fold')}")
+        for r in range(2):
+            for c in range(2):
+                axes[i].text(c, r, str(int(cm[r, c])), ha="center", va="center",
+                             fontsize=13,
+                             color="white" if cm[r, c] > cm.max() * 0.5 else "black")
+    _finish(fig, out_dir, "cm_folds", save_png)
+
+
+def _finish(fig, out_dir, name, save_png):
+    fig.savefig(os.path.join(out_dir, f"{name}.png"), dpi=150,
+                bbox_inches="tight") if save_png and out_dir else plt.show()
+    if save_png and out_dir:
+        print(f"Saved: {os.path.join(out_dir, name)}.png")
+    plt.close(fig)
 
 
 def main():
     parser = argparse.ArgumentParser(description="Plot MODMA training diagnostics")
-    parser.add_argument("--type", default="unimodal",
-                        choices=["unimodal", "multimodal"])
+    parser.add_argument("--type", default="unimodal", choices=["unimodal", "multimodal"])
     parser.add_argument("--modal", default="eeg", choices=["eeg", "aud"])
-    parser.add_argument("--tag", required=True, help="Experiment tag")
+    parser.add_argument("--tag", required=True)
     parser.add_argument("--split-seed", type=int, default=2509)
-    parser.add_argument("--fold", type=str, default=None,
-                        help="Comma-separated fold numbers, e.g. '1,3' (1-based). "
-                             "Omit or use --all for all folds.")
+    parser.add_argument("--metric", default="acc", choices=list(CURVE_KEYS))
+    parser.add_argument("--fold", type=str, default=None)
     parser.add_argument("--all", action="store_true")
-    parser.add_argument("--metric", default=None,
-                        choices=["bacc", "acc", "f1", "sens", "spec"])
+    parser.add_argument("--best-fold", action="store_true")
+    parser.add_argument("--curve", action="store_true")
     parser.add_argument("--roc", action="store_true")
     parser.add_argument("--cm", action="store_true")
-    parser.add_argument("--cm-overall", action="store_true")
     parser.add_argument("--save_png", action="store_true")
     args = parser.parse_args()
 
-    results_path = find_results_path(args.type, args.modal,
-                                     args.split_seed, args.tag)
+    results_path = find_results_path(args.type, args.modal, args.split_seed, args.tag)
     results = load_results(results_path)
-    folds_data = results["folds"]
-    print(f"Loaded: {results_path}  ({len(folds_data)} folds, "
-          f"model={results.get('model')})")
+    folds = normalize_folds(results)
+    print(f"Loaded: {results_path}  ({len(folds)} folds)")
 
-    fold_ids = parse_folds(args.fold)
-    if fold_ids is None and not args.all:
-        fold_ids = None  # == all
-
-    out_dir = None
-    if args.save_png:
-        rel = os.path.relpath(os.path.dirname(results_path), RESULTS_ROOT)
-        out_dir = os.path.join(FIGURES_ROOT, rel)
+    rel = os.path.relpath(os.path.dirname(results_path), RESULTS_ROOT)
+    out_dir = os.path.join(FIGURES_ROOT, rel) if args.save_png else None
+    if out_dir:
         os.makedirs(out_dir, exist_ok=True)
 
-    # ── Confusion matrix per fold ─────────────────────────────────────
-    if args.cm:
-        selected = select_folds(folds_data, fold_ids)
-        has_window = any("test_cm_window" in f for f in selected)
-        n_cols = 2 if has_window else 1
-        k = len(selected)
-        fig, axes = plt.subplots(
-            k, n_cols, figsize=(7 if has_window else 3.5, 3.4 * k),
-            constrained_layout=True)
-        if k == 1:
-            axes = np.array([axes])
-        for i, fe in enumerate(selected):
-            _plot_cm_pair(axes[i] if n_cols == 2 else axes, fe,
-                          fe["fold"], show_title=k > 1)
-        name = "all_folds_cm" if fold_ids is None else "cm"
-        if fold_ids is not None:
-            fig.suptitle(f"Folds {fold_ids} — Confusion matrices")
-        _finish(fig, out_dir, name, args.save_png)
-        return
-
-    # ── Overall confusion matrix ─────────────────────────────────────
-    if args.cm_overall:
-        has_window = any("test_cm_window" in f for f in folds_data)
-        if has_window:
-            cm_w = np.sum([np.array(f["test_cm_window"]) for f in folds_data], axis=0)
-            cm_s = np.sum([np.array(f["test_cm_subject"]) for f in folds_data], axis=0)
-            fig, axes = plt.subplots(1, 2, figsize=(7, 3.4), constrained_layout=True)
-            _ = _plot_cm(cm_w, axes[0], "Overall — Windows")
-            _ = _plot_cm(cm_s, axes[1], "Overall — Subjects")
-        else:
-            fig, ax = plt.subplots(1, 1, figsize=(3.5, 3.4), constrained_layout=True)
-            _ = _plot_cm(np.sum([np.array(f["test_cm"]) for f in folds_data], axis=0),
-                         ax, "Overall")
-        _finish(fig, out_dir, "overall_cm", args.save_png)
-        return
-
-    # ── ROC per fold ─────────────────────────────────────────────────
     if args.roc:
-        selected = select_folds(folds_data, fold_ids)
-        k = len(selected)
-        fig, axes = plt.subplots(k, 2, figsize=(10, 3.4 * k),
-                                 constrained_layout=True)
-        if k == 1:
-            axes = np.array([axes])
-        for i, fe in enumerate(selected):
-            _plot_roc(axes[i], fe, fe["fold"], show_legend=i == 0)
-        name = "all_folds_roc" if fold_ids is None else "roc"
-        if fold_ids is not None:
-            fig.suptitle(f"Folds {fold_ids} — ROC")
-        _finish(fig, out_dir, name, args.save_png)
+        plot_roc(folds, out_dir, args.save_png)
         return
-
-    # ── Training curves per fold ─────────────────────────────────────
-    metric = args.metric or "bacc"
-    selected = select_folds(folds_data, fold_ids)
-    k = len(selected)
-    fig, axes = plt.subplots(k, 2, figsize=(10, 3.2 * k), constrained_layout=True)
-    if k == 1:
-        axes = np.array([axes])
-    for i, fe in enumerate(selected):
-        hist = fe.get("history") or {}
-        if not hist.get("train_loss"):
-            axes[i][0].text(0.5, 0.5, "No curves", ha="center", va="center",
-                            transform=axes[i][0].transAxes)
-            axes[i][1].text(0.5, 0.5, "No curves", ha="center", va="center",
-                            transform=axes[i][1].transAxes)
-            continue
-        _plot_metric_curves(axes[i], hist, fe["fold"], metric,
-                            show_legend=i == 0)
-    name = f"all_folds_{metric}" if fold_ids is None else metric
-    if fold_ids is not None:
-        fig.suptitle(f"Folds {fold_ids} — {metric.upper()}")
-    _finish(fig, out_dir, name, args.save_png)
-
-
-def _finish(fig, out_dir, name, save_png):
-    if save_png:
-        fname = os.path.join(out_dir, f"{name}.png")
-        fig.savefig(fname, dpi=150, bbox_inches="tight")
-        print(f"Saved: {fname}")
-    else:
-        plt.show()
+    if args.cm:
+        plot_cm(folds, out_dir, args.save_png)
+        return
+    plot_curves(folds, args.metric, out_dir, args.save_png,
+                args.best_fold or args.fold is None, args.tag)
 
 
 if __name__ == "__main__":
